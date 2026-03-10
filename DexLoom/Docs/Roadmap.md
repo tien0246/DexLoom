@@ -2,113 +2,127 @@
 
 ## Milestone Plan
 
-### Milestone 0: Feasibility Analysis (COMPLETE)
+### Milestone 0: Feasibility Analysis -- COMPLETE
 - Architecture comparison document
 - iOS platform constraint analysis
 - Chosen approach: DEX bytecode interpreter + mini framework
 
-### Milestone 1: APK Parsing and Inspection
-- ZIP file format parser (PKZIP)
+### Milestone 1: APK Parsing and Inspection -- COMPLETE
+- ZIP file format parser (PKZIP) with hardening (path traversal, zip bomb)
 - Entry enumeration and extraction
 - Identify classes.dex, AndroidManifest.xml, resources.arsc, res/
-- CLI inspector tool for validation
-- **Deliverable**: Can list and extract all APK contents
+- **Delivered**: Full APK content listing and extraction
 
-### Milestone 2: AndroidManifest.xml and resources.arsc Decoding
-- Android Binary XML (AXML) parser
+### Milestone 2: AndroidManifest.xml and resources.arsc Decoding -- COMPLETE
+- Android Binary XML (AXML) parser with depth limits
 - String pool, resource map, namespace handling
-- Extract package name, main activity, permissions
-- resources.arsc: string pool, type specs, entries
-- **Deliverable**: Can print manifest contents and resource strings
+- Manifest parsing: package name, main activity, permissions
+- Intent-filter details, meta-data, uses-feature, uses-library, exported flag
+- resources.arsc: string pool, type specs, entries, dimension decoding
+- **Delivered**: Full manifest and resource decoding
 
-### Milestone 3: DEX Parsing
-- DEX header validation (magic, checksum, version)
-- String ID table, Type ID table, Proto ID table
-- Field ID table, Method ID table
-- Class definitions
-- Code items with bytecode
-- **Deliverable**: Can dump all classes, methods, and disassemble bytecode
+### Milestone 3: DEX Parsing -- COMPLETE
+- DEX header validation (magic, checksum, versions 035-039)
+- All ID tables: string, type, proto, field, method
+- Class definitions with annotations (type + visibility)
+- Code items with bytecode, debug info (line number tables)
+- Encoded values: VALUE_ARRAY, VALUE_ANNOTATION, all types
+- **Delivered**: Full DEX parsing with annotation and debug info support
 
-### Milestone 4: Tiny Java Runtime / Class Library Subset
+### Milestone 4: Java Runtime / Class Library -- COMPLETE
 - Object model: heap objects with class pointers and fields
-- String representation (backed by C strings or UTF-16)
-- Array types (object arrays, int arrays)
-- Basic exception model (try/catch flow)
-- Class metadata: vtables, field layouts, static fields
-- **Deliverable**: Can create objects, call methods, access fields in unit tests
+- 400+ framework classes spanning Android, Java stdlib, and third-party libraries
+- String (35+ methods), HashMap, ArrayList, Collections, Arrays, Objects
+- Autoboxing for all primitive wrapper types
+- Real ArrayList Iterator with for-each loop support
+- Collection interfaces (Iterable/Collection/List/Set/Map) on 15+ classes
+- Exception model with cross-method unwinding and finally blocks
+- ByteBuffer, WeakReference/SoftReference, Enum, Number, Pair
+- **Delivered**: Production-grade class library
 
-### Milestone 5: Bytecode Interpreter
-- Register file per frame
-- Opcode dispatch loop (switch-based)
-- Supported opcodes for demo:
-  - const/4, const/16, const-string
-  - move, move-result
-  - return-void, return
-  - invoke-virtual, invoke-direct, invoke-static
-  - iget, iput, sget, sput
-  - new-instance
-  - if-eq, if-ne, goto
-- Method call/return with frame push/pop
-- **Deliverable**: Can execute simple methods in unit tests
+### Milestone 5: Bytecode Interpreter -- COMPLETE
+- All 256 Dalvik opcodes with edge case handling
+- 64-frame pool, FNV-1a class hash table (O(1) lookup)
+- Exception try/catch/finally with cross-method unwinding
+- Varargs method invocation (pack_varargs)
+- Null-safe instance-of/check-cast
+- **Delivered**: Full interpreter with production-grade opcode coverage
 
-### Milestone 6: Android UI Subset Mapped to SwiftUI
-- Layout XML parsing (binary XML subset)
-- UI tree: DxNode with type, attributes, children
-- Layout engine: LinearLayout vertical/horizontal
-- View types: TextView, Button, LinearLayout
-- Render model: serialized tree for Swift consumption
-- SwiftUI bridge: recursive view builder from render model
-- **Deliverable**: Can render a static layout from XML
+### Milestone 6: Android UI Rendering -- COMPLETE
+- Layout XML parsing (binary XML)
+- 30+ view types: TextView, Button, EditText, ImageView, RecyclerView, ListView, GridView, Spinner, SeekBar, RatingBar, RadioButton/Group, FAB, TabLayout, ViewPager, WebView, Chip, BottomNav, SwipeRefreshLayout
+- ConstraintLayout basic solver (12 constraint attributes, GeometryReader positioning)
+- Drawable loading from APK (PNG/JPEG extraction, UIImage rendering)
+- Dimension conversion with padding/margin support
+- WebView mapped to WKWebView bridge
+- **Delivered**: Rich UI rendering with 30+ view types and constraint solving
 
-### Milestone 7: Event Loop and Activity Lifecycle
-- Activity.onCreate(Bundle) simulation
-- setContentView(layoutId) -> parse layout, build UI tree
-- findViewById(id) -> return view reference
-- OnClickListener dispatch
-- setText() -> UI tree update -> SwiftUI re-render
-- **Deliverable**: Can run Activity lifecycle and handle clicks
+### Milestone 7: Activity Lifecycle & Navigation -- COMPLETE
+- Full lifecycle: onCreate->onPostCreate->onStart->onResume->onPostResume + teardown
+- State save/restore: onSaveInstanceState/onRestoreInstanceState, Activity.recreate()
+- Multi-activity navigation with Intent extras
+- 16-deep back-stack; startActivityForResult/setResult/finish/onActivityResult
+- Fragment lifecycle: onCreateView->onViewCreated->onStart->onResume
+- Configuration class
+- **Delivered**: Complete activity lifecycle and navigation
 
-### Milestone 8: Demo APK Execution
-- End-to-end: load APK -> parse -> interpret -> render -> interact
-- Demo app: Hello World with button that changes text
-- Logging and trace output
-- **Deliverable**: Working demo on iOS simulator
+### Milestone 8: Event Handling & Touch -- COMPLETE
+- onClick on all view types, long-press support
+- SwipeRefreshLayout pull-to-refresh
+- MotionEvent dispatch
+- Menu system: Menu/MenuItem/SubMenu/MenuInflater
+- TextWatcher/Editable, CompoundButton isChecked/setChecked/toggle
+- Back button: dx_runtime_dispatch_back calls Activity.onBackPressed
+- **Delivered**: Full event handling including touch, menus, and text input
 
-### Milestone 9: Debugging, Logging, and Conformance Tests
-- Trace mode: log every opcode executed
-- Method entry/exit logging
-- UI tree dump
-- Regression test suite
-- Known-good test APKs
-- **Deliverable**: Debuggable, testable runtime
+### Milestone 9: System Services & I/O -- COMPLETE
+- AssetManager.open() extracts from APK; InputStream with real read/available/close
+- File I/O: File.createTempFile, Context.openFileInput/openFileOutput
+- Filesystem: getExternalFilesDir, Environment paths
+- Permissions: checkSelfPermission (safe vs dangerous), requestPermissions with callback
+- SQLiteDatabase stub with Cursor and transaction support
+- HttpURLConnection stub with simulated 200 response
+- BroadcastReceiver: registerReceiver/sendBroadcast with Intent action dispatch
+- Service lifecycle: startService->onCreate->onStartCommand; IntentService subclass
+- ContentProvider/ContentResolver stub CRUD
+- **Delivered**: File I/O, assets, permissions, and system service stubs
 
-## Version 1 Feature Matrix
+### Milestone 10: Advanced Runtime -- COMPLETE
+- Reflection: Class.forName, Method.invoke, Field.get/set, getAnnotation
+- Advanced reflection: Proxy.newProxyInstance, Array.newInstance, Constructor, getDeclaredMethods/Fields
+- JNI bridge: Complete JNIEnv (232 functions), Call*Method, Get/Set*Field, RegisterNatives
+- Cooperative threading: Thread.start (synchronous), ExecutorService, Future, CompletableFuture
+- LiveData/ViewModel with observer notification
+- Third-party libraries: RxJava3 (11 classes, 85 methods), OkHttp3 (18 classes, 120 methods), Retrofit2 (12 classes, 50 methods), Glide (6 classes, 40 methods)
+- **Delivered**: Reflection, JNI, threading, and major third-party library support
 
-### Supported
-- One Activity per app
-- onCreate lifecycle callback
-- setContentView with layout resource
-- findViewById
-- TextView: setText, getText
-- Button: setOnClickListener
-- LinearLayout: vertical orientation
-- String resources
-- Layout resources (binary XML)
-- ~25 DEX opcodes (enough for demo)
+### Milestone 11: Debug & Diagnostics -- COMPLETE
+- UI tree inspector (visual hierarchy debugging)
+- Heap inspector (memory/object analysis)
+- Error diagnostics (enhanced error reporting)
+- Build/VERSION constants: SDK_INT=33, RELEASE="13"
+- Line number tables from DEX debug_info_item
+- **Delivered**: Debug tooling for runtime inspection
 
-### Explicitly Not Supported in v1
-- Services, BroadcastReceivers, ContentProviders
-- Multiple Activities / Intents
-- JNI / native code
-- Threading / AsyncTask / coroutines
-- Networking
-- File I/O from guest code
-- Fragments
-- RecyclerView, ImageView, EditText
-- Animations
-- Permissions system
-- SharedPreferences
-- Reflection
-- Multidex
-- Kotlin-specific bytecode patterns
-- Obfuscated/optimized APKs
+## Current Feature Summary
+
+### Fully Supported
+- All 256 Dalvik opcodes with edge case handling
+- 400+ framework classes (Android, Java, Kotlin, RxJava, OkHttp, Retrofit, Glide)
+- 30+ view types with ConstraintLayout basic solver
+- Full activity lifecycle with state save/restore and 16-deep back-stack
+- Fragment lifecycle, Service, BroadcastReceiver, ContentProvider
+- Reflection including Proxy, Constructor, annotations
+- JNI bridge (232 functions)
+- AssetManager, File I/O, permissions system
+- Touch events, menus, text input, long-press
+- Cooperative threading, LiveData/ViewModel
+- Debug tools: UI tree inspector, heap inspector, error diagnostics
+
+### Known Limitations
+- Compose apps: fundamentally unsupported (need Compose compiler runtime)
+- JNI: Can't load .so files (no dlopen); provides env for DEX-side JNI calls only
+- HttpURLConnection: stub only, no real networking yet
+- Threading: cooperative (synchronous) only, no true concurrency
+- Multidex: not supported
+- Obfuscated/heavily optimized APKs: may have issues

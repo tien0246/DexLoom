@@ -206,6 +206,18 @@ struct DxVM {
     // Pending exception for cross-method unwinding
     DxObject  *pending_exception;
 
+    // Diagnostic info captured on error
+    struct {
+        bool     has_error;
+        char     method_name[128];    // "Lcom/example/Foo;.bar"
+        uint32_t pc;                  // program counter at error
+        uint8_t  opcode;              // opcode at error
+        char     opcode_name[32];     // human-readable opcode name
+        uint32_t reg_count;           // number of registers to show
+        DxValue  registers[16];       // snapshot of first 16 registers
+        char     stack_trace[2048];   // formatted call chain
+    } diag;
+
     // SharedPreferences in-memory store (simple key-value)
     #define DX_MAX_PREFS_ENTRIES 256
     struct {
@@ -255,5 +267,9 @@ void     dx_vm_free_frame(DxVM *vm, DxFrame *frame);
 // Execution
 DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args, uint32_t arg_count, DxValue *result);
 DxResult dx_vm_run_main_activity(DxVM *vm, const char *activity_class);
+
+// Diagnostics
+char *dx_vm_heap_stats(DxVM *vm);
+char *dx_vm_get_last_error_detail(DxVM *vm);
 
 #endif // DX_VM_H

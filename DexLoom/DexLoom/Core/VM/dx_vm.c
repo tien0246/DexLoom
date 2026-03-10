@@ -2301,6 +2301,653 @@ static DxResult native_class_isassignablefrom(DxVM *vm, DxFrame *frame, DxValue 
     return DX_OK;
 }
 
+// ============================================================
+// Reflection: Annotations on Class
+// ============================================================
+
+// Helper: extract DxClass* from a java.lang.Class object
+// Supports both patterns: klass-pointer-as-class and field[0]-as-int
+static DxClass *extract_dxclass(DxObject *class_obj) {
+    if (!class_obj) return NULL;
+    // The dx_vm.c pattern: class_obj->klass IS the class it represents
+    // (as set by Object.getClass() and Class.forName in dx_vm.c)
+    if (class_obj->klass) return class_obj->klass;
+    return NULL;
+}
+
+// Class.getAnnotation(Class annotationType) -> Annotation or null
+static DxResult native_class_getannotation(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxClass *cls = extract_dxclass(args[0].obj);
+    // args[1] = annotation type Class object
+    DxClass *anno_type = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? extract_dxclass(args[1].obj) : NULL;
+
+    if (cls && anno_type && cls->annotations && anno_type->descriptor) {
+        for (uint32_t i = 0; i < cls->annotation_count; i++) {
+            if (cls->annotations[i].type && strcmp(cls->annotations[i].type, anno_type->descriptor) == 0) {
+                // Return an object of the annotation type
+                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_type);
+                frame->result = anno_obj ? DX_OBJ_VALUE(anno_obj) : DX_NULL_VALUE;
+                frame->has_result = true;
+                return DX_OK;
+            }
+        }
+    }
+    frame->result = DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Class.getAnnotations() -> Annotation[]
+static DxResult native_class_getannotations(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxClass *cls = extract_dxclass(args[0].obj);
+
+    uint32_t count = (cls && cls->annotations) ? cls->annotation_count : 0;
+    DxObject *arr = dx_vm_alloc_array(vm, count);
+    if (arr && cls && cls->annotations) {
+        for (uint32_t i = 0; i < count; i++) {
+            DxClass *anno_cls = dx_vm_find_class(vm, cls->annotations[i].type);
+            if (anno_cls) {
+                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_cls);
+                if (anno_obj) arr->array_elements[i] = DX_OBJ_VALUE(anno_obj);
+            }
+        }
+    }
+    frame->result = arr ? DX_OBJ_VALUE(arr) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Class.isAnnotationPresent(Class annotationType) -> boolean
+static DxResult native_class_isannotationpresent(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxClass *cls = extract_dxclass(args[0].obj);
+    DxClass *anno_type = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? extract_dxclass(args[1].obj) : NULL;
+
+    bool found = false;
+    if (cls && anno_type && cls->annotations && anno_type->descriptor) {
+        for (uint32_t i = 0; i < cls->annotation_count; i++) {
+            if (cls->annotations[i].type && strcmp(cls->annotations[i].type, anno_type->descriptor) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    frame->result = DX_INT_VALUE(found ? 1 : 0);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// Reflection: getDeclaredMethods / getDeclaredFields on Class
+// ============================================================
+
+// Class.getDeclaredMethods() -> Method[]
+static DxResult native_class_getdeclaredmethods(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxClass *cls = extract_dxclass(args[0].obj);
+    DxClass *method_cls = dx_vm_find_class(vm, "Ljava/lang/reflect/Method;");
+
+    if (!cls || !method_cls) {
+        DxObject *empty = dx_vm_alloc_array(vm, 0);
+        frame->result = empty ? DX_OBJ_VALUE(empty) : DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    uint32_t total = cls->direct_method_count + cls->virtual_method_count;
+    DxObject *arr = dx_vm_alloc_array(vm, total);
+    if (!arr) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+
+    uint32_t idx = 0;
+    // Direct methods
+    for (uint32_t i = 0; i < cls->direct_method_count && idx < total; i++) {
+        DxMethod *m = &cls->direct_methods[i];
+        DxObject *mobj = dx_vm_alloc_object(vm, method_cls);
+        if (mobj && mobj->fields && method_cls->instance_field_count > 0) {
+            mobj->fields[0].tag = DX_VAL_INT;
+            mobj->fields[0].i = (int32_t)(uintptr_t)m;
+        }
+        arr->array_elements[idx++] = mobj ? DX_OBJ_VALUE(mobj) : DX_NULL_VALUE;
+    }
+    // Virtual methods
+    for (uint32_t i = 0; i < cls->virtual_method_count && idx < total; i++) {
+        DxMethod *m = &cls->virtual_methods[i];
+        DxObject *mobj = dx_vm_alloc_object(vm, method_cls);
+        if (mobj && mobj->fields && method_cls->instance_field_count > 0) {
+            mobj->fields[0].tag = DX_VAL_INT;
+            mobj->fields[0].i = (int32_t)(uintptr_t)m;
+        }
+        arr->array_elements[idx++] = mobj ? DX_OBJ_VALUE(mobj) : DX_NULL_VALUE;
+    }
+
+    frame->result = DX_OBJ_VALUE(arr);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Class.getDeclaredFields() -> Field[]
+static DxResult native_class_getdeclaredfields(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxClass *cls = extract_dxclass(args[0].obj);
+    DxClass *field_cls_type = dx_vm_find_class(vm, "Ljava/lang/reflect/Field;");
+
+    if (!cls || !field_cls_type) {
+        DxObject *empty = dx_vm_alloc_array(vm, 0);
+        frame->result = empty ? DX_OBJ_VALUE(empty) : DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    uint32_t total = cls->instance_field_count + cls->static_field_count;
+    DxObject *arr = dx_vm_alloc_array(vm, total);
+    if (!arr) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+
+    uint32_t idx = 0;
+    // All fields come from field_defs (covers both instance and static)
+    uint32_t field_def_count = 0;
+    if (cls->field_defs) {
+        field_def_count = cls->instance_field_count + cls->static_field_count;
+    }
+    for (uint32_t i = 0; i < field_def_count && idx < total; i++) {
+        DxObject *fobj = dx_vm_alloc_object(vm, field_cls_type);
+        if (fobj && fobj->fields && field_cls_type->instance_field_count > 0 && cls->field_defs[i].name) {
+            DxObject *name_str = dx_vm_create_string(vm, cls->field_defs[i].name);
+            fobj->fields[0] = name_str ? DX_OBJ_VALUE(name_str) : DX_NULL_VALUE;
+        }
+        arr->array_elements[idx++] = fobj ? DX_OBJ_VALUE(fobj) : DX_NULL_VALUE;
+    }
+
+    frame->result = DX_OBJ_VALUE(arr);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// Reflection: Constructor
+// ============================================================
+
+// Class.getConstructor(Class...) / getDeclaredConstructor(Class...) -> Constructor
+static DxResult native_class_getconstructor(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxClass *cls = extract_dxclass(args[0].obj);
+    DxClass *ctor_cls = dx_vm_find_class(vm, "Ljava/lang/reflect/Constructor;");
+
+    if (!cls || !ctor_cls) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Find <init> method - try matching param count if Class[] arg provided
+    DxMethod *found = NULL;
+    // Check if args[1] is a Class[] array (parameter types)
+    uint32_t wanted_params = 0;
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj && args[1].obj->is_array) {
+        wanted_params = args[1].obj->array_length;
+    }
+
+    // Search direct methods for <init>
+    for (uint32_t i = 0; i < cls->direct_method_count; i++) {
+        DxMethod *m = &cls->direct_methods[i];
+        if (m->name && strcmp(m->name, "<init>") == 0) {
+            // Approximate param count from shorty: shorty length - 1 (return type) = param count
+            uint32_t param_count = m->shorty ? (uint32_t)(strlen(m->shorty) - 1) : 0;
+            if (!found || param_count == wanted_params) {
+                found = m;
+                if (param_count == wanted_params) break;
+            }
+        }
+    }
+
+    if (!found) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Create Constructor object: field[0] = DxMethod*, field[1] = DxClass*
+    DxObject *ctor_obj = dx_vm_alloc_object(vm, ctor_cls);
+    if (ctor_obj && ctor_obj->fields && ctor_cls->instance_field_count >= 2) {
+        ctor_obj->fields[0].tag = DX_VAL_INT;
+        ctor_obj->fields[0].i = (int32_t)(uintptr_t)found;
+        ctor_obj->fields[1].tag = DX_VAL_INT;
+        ctor_obj->fields[1].i = (int32_t)(uintptr_t)cls;
+    }
+    frame->result = ctor_obj ? DX_OBJ_VALUE(ctor_obj) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Constructor.newInstance(Object...) -> Object
+static DxResult native_constructor_newinstance(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *self = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self || !self->fields || self->klass->instance_field_count < 2) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DxMethod *init_method = (self->fields[0].tag == DX_VAL_INT) ? (DxMethod *)(uintptr_t)self->fields[0].i : NULL;
+    DxClass *cls = (self->fields[1].tag == DX_VAL_INT) ? (DxClass *)(uintptr_t)self->fields[1].i : NULL;
+
+    if (!init_method || !cls) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Allocate the new object
+    DxObject *obj = dx_vm_alloc_object(vm, cls);
+    if (!obj) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Build arg list: this + params from Object[] array (args[1])
+    DxValue call_args[DX_MAX_REGISTERS];
+    uint32_t call_count = 0;
+    call_args[call_count++] = DX_OBJ_VALUE(obj);
+
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj && args[1].obj->is_array) {
+        DxObject *params = args[1].obj;
+        for (uint32_t i = 0; i < params->array_length && call_count < DX_MAX_REGISTERS; i++) {
+            call_args[call_count++] = params->array_elements[i];
+        }
+    }
+
+    DxValue result = {0};
+    vm->insn_count = 0;
+    DxResult res = dx_vm_execute_method(vm, init_method, call_args, call_count, &result);
+    if (res != DX_OK && vm->pending_exception) {
+        vm->pending_exception = NULL;
+    }
+
+    frame->result = DX_OBJ_VALUE(obj);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// Reflection: Array.newInstance
+// ============================================================
+
+static DxResult native_array_newinstance(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    // args[0] = Class componentType, args[1] = int length
+    int32_t length = (arg_count > 1 && args[1].tag == DX_VAL_INT) ? args[1].i : 0;
+    if (length < 0) length = 0;
+
+    DxObject *arr = dx_vm_alloc_array(vm, (uint32_t)length);
+    frame->result = arr ? DX_OBJ_VALUE(arr) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Array.getLength(Object array) -> int
+static DxResult native_array_getlength(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *arr = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    int32_t len = (arr && arr->is_array) ? (int32_t)arr->array_length : 0;
+    frame->result = DX_INT_VALUE(len);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Array.get(Object array, int index) -> Object
+static DxResult native_array_get(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *arr = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    int32_t idx = (arg_count > 1 && args[1].tag == DX_VAL_INT) ? args[1].i : -1;
+    if (arr && arr->is_array && idx >= 0 && (uint32_t)idx < arr->array_length) {
+        frame->result = arr->array_elements[idx];
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Array.set(Object array, int index, Object value)
+static DxResult native_array_set(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame;
+    DxObject *arr = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    int32_t idx = (arg_count > 1 && args[1].tag == DX_VAL_INT) ? args[1].i : -1;
+    if (arr && arr->is_array && idx >= 0 && (uint32_t)idx < arr->array_length && arg_count > 2) {
+        arr->array_elements[idx] = args[2];
+    }
+    return DX_OK;
+}
+
+// ============================================================
+// Reflection: Proxy.newProxyInstance (simplified)
+// ============================================================
+
+// Native dispatch function for proxy method calls
+// The proxy object stores: field[0] = InvocationHandler, field[1] = Class[] interfaces
+static DxResult native_proxy_dispatch(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    // This is called as an instance method on the proxy: args[0] = proxy (this)
+    // We need to route to InvocationHandler.invoke(proxy, method, args)
+    DxObject *proxy = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!proxy || !proxy->fields || proxy->klass->instance_field_count < 1) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // field[0] = InvocationHandler
+    DxObject *handler = (proxy->fields[0].tag == DX_VAL_OBJ) ? proxy->fields[0].obj : NULL;
+    if (!handler) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Find InvocationHandler.invoke method
+    DxMethod *invoke_method = dx_vm_find_method(handler->klass, "invoke", NULL);
+    if (!invoke_method) {
+        // Try virtual methods on the handler's class
+        for (uint32_t i = 0; i < handler->klass->virtual_method_count; i++) {
+            if (handler->klass->virtual_methods[i].name &&
+                strcmp(handler->klass->virtual_methods[i].name, "invoke") == 0) {
+                invoke_method = &handler->klass->virtual_methods[i];
+                break;
+            }
+        }
+    }
+    if (!invoke_method) {
+        DX_WARN("Proxy", "InvocationHandler has no invoke method");
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Create Method object for the called method (use frame->method)
+    DxClass *method_cls = dx_vm_find_class(vm, "Ljava/lang/reflect/Method;");
+    DxObject *method_obj = method_cls ? dx_vm_alloc_object(vm, method_cls) : NULL;
+    if (method_obj && method_obj->fields && method_cls->instance_field_count > 0 && frame->method) {
+        method_obj->fields[0].tag = DX_VAL_INT;
+        method_obj->fields[0].i = (int32_t)(uintptr_t)frame->method;
+    }
+
+    // Create args array from remaining arguments
+    uint32_t extra_args = (arg_count > 1) ? arg_count - 1 : 0;
+    DxObject *args_arr = dx_vm_alloc_array(vm, extra_args);
+    if (args_arr) {
+        for (uint32_t i = 0; i < extra_args; i++) {
+            args_arr->array_elements[i] = args[i + 1];
+        }
+    }
+
+    // Call handler.invoke(proxy, method, args)
+    DxValue invoke_args[4];
+    invoke_args[0] = DX_OBJ_VALUE(handler);    // this (handler)
+    invoke_args[1] = DX_OBJ_VALUE(proxy);       // proxy
+    invoke_args[2] = method_obj ? DX_OBJ_VALUE(method_obj) : DX_NULL_VALUE;  // method
+    invoke_args[3] = args_arr ? DX_OBJ_VALUE(args_arr) : DX_NULL_VALUE;      // args
+
+    DxValue result = {0};
+    vm->insn_count = 0;
+    DxResult res = dx_vm_execute_method(vm, invoke_method, invoke_args, 4, &result);
+    if (res == DX_OK) {
+        frame->result = result;
+    } else {
+        frame->result = DX_NULL_VALUE;
+        if (vm->pending_exception) vm->pending_exception = NULL;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Proxy.newProxyInstance(ClassLoader, Class[], InvocationHandler) -> Object
+static DxResult native_proxy_newproxyinstance(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    // args[0] = ClassLoader (ignored), args[1] = Class[] interfaces, args[2] = InvocationHandler
+    DxObject *interfaces_arr = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? args[1].obj : NULL;
+    DxObject *handler = (arg_count > 2 && args[2].tag == DX_VAL_OBJ) ? args[2].obj : NULL;
+
+    if (!handler) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Create a dynamic proxy class
+    // We need a runtime-generated class that delegates all method calls to the handler
+    char proxy_desc[128];
+    static int proxy_counter = 0;
+    snprintf(proxy_desc, sizeof(proxy_desc), "L$Proxy%d;", proxy_counter++);
+
+    DxClass *obj_cls = vm->class_object;
+    DxClass *proxy_cls = (DxClass *)dx_malloc(sizeof(DxClass));
+    if (!proxy_cls) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+    memset(proxy_cls, 0, sizeof(DxClass));
+
+    // Store the descriptor string permanently
+    proxy_cls->descriptor = dx_strdup(proxy_desc);
+    proxy_cls->super_class = obj_cls;
+    proxy_cls->status = DX_CLASS_INITIALIZED;
+    proxy_cls->is_framework = true;
+    proxy_cls->instance_field_count = 2; // field[0]=handler, field[1]=interfaces
+
+    // Copy interface methods as proxy dispatch methods
+    if (interfaces_arr && interfaces_arr->is_array) {
+        // Set interfaces on the proxy class
+        proxy_cls->interface_count = interfaces_arr->array_length;
+        proxy_cls->interfaces = (const char **)dx_malloc(sizeof(char *) * interfaces_arr->array_length);
+
+        for (uint32_t ii = 0; ii < interfaces_arr->array_length; ii++) {
+            DxClass *iface = NULL;
+            if (interfaces_arr->array_elements[ii].tag == DX_VAL_OBJ &&
+                interfaces_arr->array_elements[ii].obj) {
+                iface = extract_dxclass(interfaces_arr->array_elements[ii].obj);
+            }
+            if (!iface) continue;
+            if (proxy_cls->interfaces) {
+                proxy_cls->interfaces[ii] = iface->descriptor;
+            }
+
+            // Add each virtual method from the interface as a proxy dispatch method
+            for (uint32_t mi = 0; mi < iface->virtual_method_count; mi++) {
+                DxMethod *im = &iface->virtual_methods[mi];
+                // Grow virtual methods
+                uint32_t idx = proxy_cls->virtual_method_count;
+                DxMethod *new_methods = (DxMethod *)dx_realloc(proxy_cls->virtual_methods,
+                    sizeof(DxMethod) * (idx + 1));
+                if (!new_methods) continue;
+                memset(&new_methods[idx], 0, sizeof(DxMethod));
+                new_methods[idx].name = im->name;
+                new_methods[idx].shorty = im->shorty;
+                new_methods[idx].declaring_class = proxy_cls;
+                new_methods[idx].access_flags = DX_ACC_PUBLIC;
+                new_methods[idx].native_fn = native_proxy_dispatch;
+                new_methods[idx].is_native = true;
+                new_methods[idx].vtable_idx = (int32_t)idx;
+                proxy_cls->virtual_methods = new_methods;
+                proxy_cls->virtual_method_count = idx + 1;
+            }
+        }
+    }
+
+    // Register in VM
+    if (vm->class_count < DX_MAX_CLASSES) {
+        vm->classes[vm->class_count++] = proxy_cls;
+        dx_vm_class_hash_insert(vm, proxy_cls);
+    }
+
+    // Allocate the proxy object
+    DxObject *proxy_obj = dx_vm_alloc_object(vm, proxy_cls);
+    if (proxy_obj && proxy_obj->fields) {
+        proxy_obj->fields[0] = DX_OBJ_VALUE(handler);       // InvocationHandler
+        if (interfaces_arr) {
+            proxy_obj->fields[1] = DX_OBJ_VALUE(interfaces_arr); // Class[] interfaces
+        }
+    }
+
+    frame->result = proxy_obj ? DX_OBJ_VALUE(proxy_obj) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Proxy.getInvocationHandler(Object proxy) -> InvocationHandler
+static DxResult native_proxy_getinvocationhandler(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *proxy = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (proxy && proxy->fields && proxy->klass && proxy->klass->instance_field_count >= 1
+        && proxy->fields[0].tag == DX_VAL_OBJ) {
+        frame->result = proxy->fields[0];
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// Reflection: Method annotations
+// ============================================================
+
+// Method.getAnnotation(Class annotationType) -> Annotation or null
+static DxResult native_method_getannotation(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *method_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxMethod *method = NULL;
+    if (method_obj && method_obj->fields && method_obj->klass
+        && method_obj->klass->instance_field_count > 0
+        && method_obj->fields[0].tag == DX_VAL_INT) {
+        method = (DxMethod *)(uintptr_t)method_obj->fields[0].i;
+    }
+
+    DxClass *anno_type = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? extract_dxclass(args[1].obj) : NULL;
+
+    if (method && anno_type && method->annotations && anno_type->descriptor) {
+        for (uint32_t i = 0; i < method->annotation_count; i++) {
+            if (method->annotations[i].type && strcmp(method->annotations[i].type, anno_type->descriptor) == 0) {
+                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_type);
+                frame->result = anno_obj ? DX_OBJ_VALUE(anno_obj) : DX_NULL_VALUE;
+                frame->has_result = true;
+                return DX_OK;
+            }
+        }
+    }
+    frame->result = DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Method.getAnnotations() -> Annotation[]
+static DxResult native_method_getannotations(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *method_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxMethod *method = NULL;
+    if (method_obj && method_obj->fields && method_obj->klass
+        && method_obj->klass->instance_field_count > 0
+        && method_obj->fields[0].tag == DX_VAL_INT) {
+        method = (DxMethod *)(uintptr_t)method_obj->fields[0].i;
+    }
+
+    uint32_t count = (method && method->annotations) ? method->annotation_count : 0;
+    DxObject *arr = dx_vm_alloc_array(vm, count);
+    if (arr && method && method->annotations) {
+        for (uint32_t i = 0; i < count; i++) {
+            DxClass *anno_cls = dx_vm_find_class(vm, method->annotations[i].type);
+            if (anno_cls) {
+                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_cls);
+                if (anno_obj) arr->array_elements[i] = DX_OBJ_VALUE(anno_obj);
+            }
+        }
+    }
+    frame->result = arr ? DX_OBJ_VALUE(arr) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Method.isAnnotationPresent(Class annotationType) -> boolean
+static DxResult native_method_isannotationpresent(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *method_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxMethod *method = NULL;
+    if (method_obj && method_obj->fields && method_obj->klass
+        && method_obj->klass->instance_field_count > 0
+        && method_obj->fields[0].tag == DX_VAL_INT) {
+        method = (DxMethod *)(uintptr_t)method_obj->fields[0].i;
+    }
+
+    DxClass *anno_type = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? extract_dxclass(args[1].obj) : NULL;
+
+    bool found = false;
+    if (method && anno_type && method->annotations && anno_type->descriptor) {
+        for (uint32_t i = 0; i < method->annotation_count; i++) {
+            if (method->annotations[i].type && strcmp(method->annotations[i].type, anno_type->descriptor) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    frame->result = DX_INT_VALUE(found ? 1 : 0);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Method.getName() -> String
+static DxResult native_method_getname(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *method_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxMethod *method = NULL;
+    if (method_obj && method_obj->fields && method_obj->klass
+        && method_obj->klass->instance_field_count > 0
+        && method_obj->fields[0].tag == DX_VAL_INT) {
+        method = (DxMethod *)(uintptr_t)method_obj->fields[0].i;
+    }
+
+    const char *name = (method && method->name) ? method->name : "unknown";
+    DxObject *str = dx_vm_create_string(vm, name);
+    frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Method.getDeclaringClass() -> Class
+static DxResult native_method_getdeclaringclass(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *method_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxMethod *method = NULL;
+    if (method_obj && method_obj->fields && method_obj->klass
+        && method_obj->klass->instance_field_count > 0
+        && method_obj->fields[0].tag == DX_VAL_INT) {
+        method = (DxMethod *)(uintptr_t)method_obj->fields[0].i;
+    }
+
+    if (method && method->declaring_class) {
+        DxClass *class_cls = dx_vm_find_class(vm, "Ljava/lang/Class;");
+        DxObject *class_obj = dx_vm_alloc_object(vm, class_cls ? class_cls : method->declaring_class);
+        if (class_obj) {
+            class_obj->klass = method->declaring_class;
+        }
+        frame->result = class_obj ? DX_OBJ_VALUE(class_obj) : DX_NULL_VALUE;
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Field.getName() -> String
+static DxResult native_field_getname(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *field_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    const char *name = NULL;
+    if (field_obj && field_obj->fields && field_obj->klass
+        && field_obj->klass->instance_field_count > 0
+        && field_obj->fields[0].tag == DX_VAL_OBJ && field_obj->fields[0].obj) {
+        name = dx_vm_get_string_value(field_obj->fields[0].obj);
+    }
+    DxObject *str = dx_vm_create_string(vm, name ? name : "unknown");
+    frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
 // --- Register java.lang classes ---
 
 DxResult dx_register_java_lang(DxVM *vm) {
@@ -2589,16 +3236,34 @@ DxResult dx_register_java_lang(DxVM *vm) {
                       native_class_forname, true);  // 3-arg variant
     add_native_method(class_cls, "isAssignableFrom", "ZL", DX_ACC_PUBLIC,
                       native_class_isassignablefrom, false);
-    // Annotation support stubs
+    // Real annotation support
     add_native_method(class_cls, "getAnnotation", "LL", DX_ACC_PUBLIC,
-                      native_return_null_vm, false);
+                      native_class_getannotation, false);
     add_native_method(class_cls, "getAnnotations", "L", DX_ACC_PUBLIC,
-                      native_return_null_vm, false);
+                      native_class_getannotations, false);
     add_native_method(class_cls, "getDeclaredAnnotations", "L", DX_ACC_PUBLIC,
-                      native_return_null_vm, false);
+                      native_class_getannotations, false);
     add_native_method(class_cls, "isAnnotationPresent", "ZL", DX_ACC_PUBLIC,
-                      native_return_false_vm, false);
+                      native_class_isannotationpresent, false);
     add_native_method(class_cls, "getInterfaces", "L", DX_ACC_PUBLIC,
+                      native_return_null_vm, false);
+    // getDeclaredMethods / getDeclaredFields (real implementations)
+    add_native_method(class_cls, "getDeclaredMethods", "L", DX_ACC_PUBLIC,
+                      native_class_getdeclaredmethods, false);
+    add_native_method(class_cls, "getDeclaredFields", "L", DX_ACC_PUBLIC,
+                      native_class_getdeclaredfields, false);
+    add_native_method(class_cls, "getMethods", "L", DX_ACC_PUBLIC,
+                      native_class_getdeclaredmethods, false);
+    add_native_method(class_cls, "getFields", "L", DX_ACC_PUBLIC,
+                      native_class_getdeclaredfields, false);
+    // Constructor access
+    add_native_method(class_cls, "getConstructor", "LL", DX_ACC_PUBLIC,
+                      native_class_getconstructor, false);
+    add_native_method(class_cls, "getDeclaredConstructor", "LL", DX_ACC_PUBLIC,
+                      native_class_getconstructor, false);
+    add_native_method(class_cls, "getConstructors", "L", DX_ACC_PUBLIC,
+                      native_return_null_vm, false);
+    add_native_method(class_cls, "getDeclaredConstructors", "L", DX_ACC_PUBLIC,
                       native_return_null_vm, false);
     add_native_method(class_cls, "isInterface", "Z", DX_ACC_PUBLIC,
                       native_class_isinterface, false);
@@ -2607,6 +3272,46 @@ DxResult dx_register_java_lang(DxVM *vm) {
     add_native_method(class_cls, "isArray", "Z", DX_ACC_PUBLIC,
                       native_class_isarray, false);
     class_cls->status = DX_CLASS_INITIALIZED;
+
+    // java.lang.reflect.Constructor
+    DxClass *ctor_cls = create_class(vm, "Ljava/lang/reflect/Constructor;", obj_cls, true);
+    ctor_cls->instance_field_count = 2;  // field[0] = DxMethod* (as int), field[1] = DxClass* (as int)
+    add_native_method(ctor_cls, "newInstance", "LL", DX_ACC_PUBLIC,
+                      native_constructor_newinstance, false);
+    add_native_method(ctor_cls, "setAccessible", "VZ", DX_ACC_PUBLIC,
+                      native_object_init, false);
+    add_native_method(ctor_cls, "getParameterTypes", "L", DX_ACC_PUBLIC,
+                      native_return_null_vm, false);
+    add_native_method(ctor_cls, "getModifiers", "I", DX_ACC_PUBLIC,
+                      native_return_false_vm, false);
+    ctor_cls->status = DX_CLASS_INITIALIZED;
+
+    // java.lang.reflect.Array
+    DxClass *array_cls = create_class(vm, "Ljava/lang/reflect/Array;", obj_cls, true);
+    add_native_method(array_cls, "newInstance", "LLI", DX_ACC_PUBLIC | DX_ACC_STATIC,
+                      native_array_newinstance, true);
+    add_native_method(array_cls, "getLength", "IL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+                      native_array_getlength, true);
+    add_native_method(array_cls, "get", "LLI", DX_ACC_PUBLIC | DX_ACC_STATIC,
+                      native_array_get, true);
+    add_native_method(array_cls, "set", "VLIL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+                      native_array_set, true);
+    array_cls->status = DX_CLASS_INITIALIZED;
+
+    // java.lang.reflect.InvocationHandler (interface)
+    DxClass *invhandler_cls = create_class(vm, "Ljava/lang/reflect/InvocationHandler;", obj_cls, true);
+    invhandler_cls->access_flags = DX_ACC_PUBLIC | DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    add_native_method(invhandler_cls, "invoke", "LLLL", DX_ACC_PUBLIC | DX_ACC_ABSTRACT,
+                      native_return_null_vm, false);
+    invhandler_cls->status = DX_CLASS_INITIALIZED;
+
+    // java.lang.reflect.Proxy
+    DxClass *proxy_cls = create_class(vm, "Ljava/lang/reflect/Proxy;", obj_cls, true);
+    add_native_method(proxy_cls, "newProxyInstance", "LLLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+                      native_proxy_newproxyinstance, true);
+    add_native_method(proxy_cls, "getInvocationHandler", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+                      native_proxy_getinvocationhandler, true);
+    proxy_cls->status = DX_CLASS_INITIALIZED;
 
     // java.lang.System
     DxClass *sys_cls = create_class(vm, "Ljava/lang/System;", obj_cls, true);
@@ -3875,4 +4580,185 @@ DxObject *dx_vm_create_exception(DxVM *vm, const char *class_descriptor, const c
     }
 
     return exc;
+}
+
+// ============================================================
+// Diagnostics: heap inspector
+// ============================================================
+
+char *dx_vm_heap_stats(DxVM *vm) {
+    if (!vm) return dx_strdup("(no VM)\n");
+
+    // Count live objects and tally by class
+    uint32_t live = 0;
+    uint32_t arrays = 0;
+
+    // Top-N class tracking
+    #define HEAP_TOP_N 10
+    struct { const char *desc; uint32_t count; } top[HEAP_TOP_N];
+    memset(top, 0, sizeof(top));
+    uint32_t top_count = 0;
+
+    for (uint32_t i = 0; i < vm->heap_count; i++) {
+        DxObject *obj = vm->heap[i];
+        if (!obj) continue;
+        live++;
+        if (obj->is_array) { arrays++; continue; }
+
+        const char *desc = obj->klass ? obj->klass->descriptor : "(null)";
+        // Find or insert in top list
+        bool found = false;
+        for (uint32_t t = 0; t < top_count; t++) {
+            if (strcmp(top[t].desc, desc) == 0) {
+                top[t].count++;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (top_count < HEAP_TOP_N) {
+                top[top_count].desc = desc;
+                top[top_count].count = 1;
+                top_count++;
+            } else {
+                // Replace the smallest entry if this one is bigger
+                uint32_t min_idx = 0;
+                for (uint32_t t = 1; t < HEAP_TOP_N; t++) {
+                    if (top[t].count < top[min_idx].count) min_idx = t;
+                }
+                if (top[min_idx].count == 0) {
+                    top[min_idx].desc = desc;
+                    top[min_idx].count = 1;
+                }
+            }
+        }
+    }
+
+    // Sort top entries by count descending
+    for (uint32_t i = 0; i < top_count; i++) {
+        for (uint32_t j = i + 1; j < top_count; j++) {
+            if (top[j].count > top[i].count) {
+                const char *td = top[i].desc; uint32_t tc = top[i].count;
+                top[i].desc = top[j].desc; top[i].count = top[j].count;
+                top[j].desc = td; top[j].count = tc;
+            }
+        }
+    }
+
+    // Memory stats
+    uint64_t allocs = 0, frees = 0, bytes = 0;
+    dx_memory_stats(&allocs, &frees, &bytes);
+
+    // Build output
+    char buf[2048];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "Heap Statistics:\n"
+        "  Capacity:      %u slots\n"
+        "  Used:          %u slots\n"
+        "  Live objects:  %u\n"
+        "  Arrays:        %u\n"
+        "  Classes:       %u\n"
+        "  Instructions:  %llu total\n"
+        "  Memory:        %llu allocs, %llu frees, %llu bytes outstanding\n",
+        DX_MAX_HEAP_OBJECTS, vm->heap_count, live, arrays,
+        vm->class_count, vm->insn_total,
+        allocs, frees, bytes);
+
+    if (top_count > 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Top classes by instance count:\n");
+        for (uint32_t t = 0; t < top_count && t < HEAP_TOP_N; t++) {
+            if (top[t].count == 0) break;
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "    %4u  %s\n", top[t].count, top[t].desc);
+        }
+    }
+
+    #undef HEAP_TOP_N
+    return dx_strdup(buf);
+}
+
+// ============================================================
+// Diagnostics: error detail with stack trace
+// ============================================================
+
+char *dx_vm_get_last_error_detail(DxVM *vm) {
+    if (!vm || !vm->diag.has_error) return dx_strdup("(no error recorded)\n");
+
+    char buf[4096];
+    int pos = 0;
+
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "Error Detail:\n"
+        "  Method:  %s\n"
+        "  PC:      %u\n"
+        "  Opcode:  0x%02x (%s)\n",
+        vm->diag.method_name,
+        vm->diag.pc,
+        vm->diag.opcode,
+        vm->diag.opcode_name);
+
+    // Register snapshot
+    if (vm->diag.reg_count > 0) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "  Registers:\n");
+        for (uint32_t r = 0; r < vm->diag.reg_count && r < 16; r++) {
+            DxValue v = vm->diag.registers[r];
+            switch (v.tag) {
+                case DX_VAL_INT:
+                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "    v%-3u = int %d (0x%x)\n", r, v.i, (uint32_t)v.i);
+                    break;
+                case DX_VAL_LONG:
+                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "    v%-3u = long %lld\n", r, (long long)v.l);
+                    break;
+                case DX_VAL_FLOAT:
+                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "    v%-3u = float %f\n", r, v.f);
+                    break;
+                case DX_VAL_DOUBLE:
+                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "    v%-3u = double %f\n", r, v.d);
+                    break;
+                case DX_VAL_OBJ:
+                    if (v.obj) {
+                        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                            "    v%-3u = obj %s @%p\n", r,
+                            v.obj->klass ? v.obj->klass->descriptor : "?",
+                            (void *)v.obj);
+                    } else {
+                        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                            "    v%-3u = null\n", r);
+                    }
+                    break;
+                default:
+                    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "    v%-3u = void\n", r);
+                    break;
+            }
+            if ((uint32_t)pos >= sizeof(buf) - 100) break;
+        }
+    }
+
+    // Stack trace
+    if (vm->diag.stack_trace[0] != '\0') {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "  Stack Trace:\n%s", vm->diag.stack_trace);
+    }
+
+    // Pending exception info
+    if (vm->pending_exception && vm->pending_exception->klass) {
+        const char *exc_desc = vm->pending_exception->klass->descriptor;
+        DxValue msg_val;
+        const char *msg = "";
+        if (dx_vm_get_field(vm->pending_exception, "detailMessage", &msg_val) == DX_OK &&
+            msg_val.tag == DX_VAL_OBJ && msg_val.obj) {
+            msg = dx_vm_get_string_value(msg_val.obj);
+            if (!msg) msg = "";
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "  Exception: %s: %s\n", exc_desc, msg);
+    }
+
+    return dx_strdup(buf);
 }

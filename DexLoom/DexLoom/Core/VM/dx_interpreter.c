@@ -2225,6 +2225,48 @@ done:
         }
     }
 
+    // Capture diagnostic info on error
+    if (exec_result != DX_OK) {
+        vm->diag.has_error = true;
+        snprintf(vm->diag.method_name, sizeof(vm->diag.method_name), "%s.%s",
+                 method->declaring_class ? method->declaring_class->descriptor : "?",
+                 method->name ? method->name : "?");
+        vm->diag.pc = pc;
+        if (pc < code_size) {
+            vm->diag.opcode = code[pc] & 0xFF;
+        } else {
+            vm->diag.opcode = 0;
+        }
+        snprintf(vm->diag.opcode_name, sizeof(vm->diag.opcode_name), "%s",
+                 dx_opcode_name(vm->diag.opcode));
+
+        // Snapshot registers (up to 16)
+        uint16_t snap_count = method->code.registers_size;
+        if (snap_count > 16) snap_count = 16;
+        vm->diag.reg_count = snap_count;
+        for (uint32_t r = 0; r < snap_count; r++) {
+            vm->diag.registers[r] = frame->registers[r];
+        }
+
+        // Build stack trace from frame chain
+        int spos = 0;
+        vm->diag.stack_trace[0] = '\0';
+        DxFrame *sf = frame;
+        int depth = 0;
+        while (sf && depth < 32 && spos < (int)sizeof(vm->diag.stack_trace) - 80) {
+            if (sf->method) {
+                spos += snprintf(vm->diag.stack_trace + spos,
+                                 sizeof(vm->diag.stack_trace) - spos,
+                                 "    at %s.%s (pc=%u)\n",
+                                 sf->method->declaring_class ? sf->method->declaring_class->descriptor : "?",
+                                 sf->method->name ? sf->method->name : "?",
+                                 sf->pc);
+            }
+            sf = sf->caller;
+            depth++;
+        }
+    }
+
     vm->stack_depth--;
     vm->current_frame = frame->caller;
 

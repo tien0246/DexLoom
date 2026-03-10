@@ -33,6 +33,7 @@ void dx_context_destroy(DxContext *ctx) {
     if (ctx->ui_root) dx_ui_node_destroy(ctx->ui_root);
     if (ctx->render_model) dx_render_model_destroy(ctx->render_model);
 
+    if (ctx->theme) dx_theme_free(ctx->theme);
     if (ctx->resources) dx_resources_free(ctx->resources);
 
     if (ctx->apk) dx_apk_close(ctx->apk);

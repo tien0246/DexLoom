@@ -31,6 +31,11 @@
 #define RES_VALUE_TYPE_INT_COLOR_RGB4  0x1f
 
 #define INITIAL_ENTRY_CAPACITY 256
+#define INITIAL_STYLE_CAPACITY 64
+#define MAX_STYLE_PARENT_DEPTH 20
+
+// ResTable_entry flags
+#define FLAG_COMPLEX 0x0001
 
 static uint16_t read_u16(const uint8_t *p) {
     return (uint16_t)(p[0] | (p[1] << 8));
@@ -176,6 +181,36 @@ static bool add_resource_entry(DxResources *res, const DxResourceEntry *entry) {
     return true;
 }
 
+// Add a style record to the table, growing if needed
+static bool add_style_record(DxResources *res, uint32_t style_res_id, uint32_t parent_id,
+                              DxStyleEntry *entries, uint32_t entry_count) {
+    if (res->style_count >= res->style_capacity) {
+        uint32_t new_cap = res->style_capacity == 0 ? INITIAL_STYLE_CAPACITY : res->style_capacity * 2;
+        DxStyleRecord *new_styles = (DxStyleRecord *)dx_realloc(
+            res->styles, sizeof(DxStyleRecord) * new_cap);
+        if (!new_styles) { dx_free(entries); return false; }
+        res->styles = new_styles;
+        res->style_capacity = new_cap;
+    }
+    DxStyleRecord *rec = &res->styles[res->style_count++];
+    rec->style_res_id = style_res_id;
+    rec->parent_id = parent_id;
+    rec->entries = entries;
+    rec->entry_count = entry_count;
+    return true;
+}
+
+// Find a style record by resource ID
+static const DxStyleRecord *find_style_record(const DxResources *res, uint32_t style_res_id) {
+    if (!res) return NULL;
+    for (uint32_t i = 0; i < res->style_count; i++) {
+        if (res->styles[i].style_res_id == style_res_id) {
+            return &res->styles[i];
+        }
+    }
+    return NULL;
+}
+
 // Decode a float from raw uint32 bits
 static float decode_float(uint32_t raw) {
     union { uint32_t u; float f; } conv;
@@ -296,8 +331,69 @@ DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **ou
                         uint16_t entry_size = read_u16(data + entry_pos);
                         uint16_t entry_flags = read_u16(data + entry_pos + 2);
                         uint32_t key_idx = read_u32(data + entry_pos + 4);
-                        (void)entry_flags;
 
+                        uint32_t res_id = (pkg_id << 24) | ((uint32_t)type_id << 16) | e;
+
+                        // Get the key name for this entry
+                        const char *key_name = (key_strings && key_idx < key_count) ?
+                                                key_strings[key_idx] : NULL;
+
+                        // --- Handle complex/bag entries (styles, arrays, plurals) ---
+                        if (entry_flags & FLAG_COMPLEX) {
+                            // ResTable_map_entry: 16-byte header (entry 8 + parent 4 + count 4)
+                            if (entry_pos + 16 > size) continue;
+                            uint32_t parent_ref = read_u32(data + entry_pos + 8);
+                            uint32_t map_count = read_u32(data + entry_pos + 12);
+
+                            // Allocate style entries
+                            DxStyleEntry *style_entries = NULL;
+                            uint32_t valid_count = 0;
+                            if (map_count > 0 && map_count < 10000) {
+                                style_entries = (DxStyleEntry *)dx_malloc(sizeof(DxStyleEntry) * map_count);
+                            }
+
+                            // Each map entry: 4 bytes name(attr_id) + 8 bytes Res_value (size,0,type,data)
+                            uint32_t map_pos = entry_pos + 16;
+                            for (uint32_t m = 0; m < map_count; m++) {
+                                if (map_pos + 12 > size) break;
+                                uint32_t map_name = read_u32(data + map_pos);
+                                // Res_value: uint16 size, uint8 res0, uint8 type, uint32 data
+                                uint8_t  map_val_type = data[map_pos + 7];
+                                uint32_t map_val_data = read_u32(data + map_pos + 8);
+
+                                if (style_entries) {
+                                    style_entries[valid_count].attr_id = map_name;
+                                    style_entries[valid_count].value_type = map_val_type;
+                                    style_entries[valid_count].value_data = map_val_data;
+                                    valid_count++;
+                                }
+
+                                map_pos += 12; // 4 + 8 bytes per map entry
+                            }
+
+                            if (style_entries && valid_count > 0) {
+                                add_style_record(res, res_id, parent_ref,
+                                                 style_entries, valid_count);
+                                DX_TRACE(TAG, "Style 0x%08x (%s): parent=0x%08x, %u attrs",
+                                         res_id, key_name ? key_name : "?",
+                                         parent_ref, valid_count);
+                            } else {
+                                dx_free(style_entries);
+                            }
+
+                            // Also add a general entry so find_by_id/find_by_name work
+                            DxResourceEntry re;
+                            memset(&re, 0, sizeof(re));
+                            re.id = res_id;
+                            re.value_type = RES_VALUE_TYPE_NULL;
+                            re.entry_name = key_name ? dx_strdup(key_name) : NULL;
+                            re.type_name = dx_strdup(type_name_str);
+                            add_resource_entry(res, &re);
+
+                            continue; // skip simple-value path
+                        }
+
+                        // --- Simple (non-bag) entry ---
                         if (entry_pos + entry_size + 8 > size) continue;
 
                         // Value is at entry_pos + 8 (after ResTable_entry header)
@@ -306,12 +402,6 @@ DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **ou
 
                         uint8_t val_type = data[val_pos + 3];
                         uint32_t val_data = read_u32(data + val_pos + 4);
-
-                        uint32_t res_id = (pkg_id << 24) | ((uint32_t)type_id << 16) | e;
-
-                        // Get the key name for this entry
-                        const char *key_name = (key_strings && key_idx < key_count) ?
-                                                key_strings[key_idx] : NULL;
 
                         // --- Populate the general resource entry table ---
                         DxResourceEntry re;
@@ -428,8 +518,9 @@ DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **ou
         pos += chunk_size;
     }
 
-    DX_INFO(TAG, "Resources parsed: %u strings, %u string entries, %u layout entries, %u total entries",
-            res->string_count, res->string_entry_count, res->layout_entry_count, res->entry_count);
+    DX_INFO(TAG, "Resources parsed: %u strings, %u string entries, %u layout entries, %u total entries, %u styles",
+            res->string_count, res->string_entry_count, res->layout_entry_count, res->entry_count,
+            res->style_count);
     *out = res;
     return DX_OK;
 
@@ -452,6 +543,12 @@ void dx_resources_free(DxResources *res) {
         dx_free(res->layout_entries[i].filename);
     }
     dx_free(res->layout_entries);
+
+    // Free style records
+    for (uint32_t i = 0; i < res->style_count; i++) {
+        dx_free(res->styles[i].entries);
+    }
+    dx_free(res->styles);
 
     // Free general entry table
     for (uint32_t i = 0; i < res->entry_count; i++) {
@@ -553,4 +650,128 @@ char *dx_resources_format_color(uint32_t argb) {
     char buf[16];
     snprintf(buf, sizeof(buf), "#%08X", argb);
     return dx_strdup(buf);
+}
+
+// ============================================================
+// Style resolution
+// ============================================================
+
+DxStyleBag *dx_resources_resolve_style(const DxResources *res, uint32_t style_res_id) {
+    if (!res || style_res_id == 0) return NULL;
+
+    // Collect all entries from child -> parent chain.
+    // Child entries override parent entries for the same attr_id.
+    // We use a simple flat array and linear dedup.
+
+    // Temporary buffer: accumulate all entries
+    uint32_t tmp_cap = 128;
+    uint32_t tmp_count = 0;
+    DxStyleEntry *tmp = (DxStyleEntry *)dx_malloc(sizeof(DxStyleEntry) * tmp_cap);
+    if (!tmp) return NULL;
+
+    uint32_t current_id = style_res_id;
+    uint32_t depth = 0;
+    uint32_t first_parent = 0;
+
+    while (current_id != 0 && depth < MAX_STYLE_PARENT_DEPTH) {
+        const DxStyleRecord *rec = find_style_record(res, current_id);
+        if (!rec) break;
+
+        if (depth == 0) {
+            first_parent = rec->parent_id;
+        }
+
+        // Add entries that don't already exist (child takes priority)
+        for (uint32_t i = 0; i < rec->entry_count; i++) {
+            uint32_t aid = rec->entries[i].attr_id;
+            // Check if already present from a more-derived style
+            bool exists = false;
+            for (uint32_t j = 0; j < tmp_count; j++) {
+                if (tmp[j].attr_id == aid) { exists = true; break; }
+            }
+            if (exists) continue;
+
+            // Grow if needed
+            if (tmp_count >= tmp_cap) {
+                tmp_cap *= 2;
+                DxStyleEntry *new_tmp = (DxStyleEntry *)dx_realloc(tmp, sizeof(DxStyleEntry) * tmp_cap);
+                if (!new_tmp) break;
+                tmp = new_tmp;
+            }
+            tmp[tmp_count++] = rec->entries[i];
+        }
+
+        current_id = rec->parent_id;
+        depth++;
+    }
+
+    if (tmp_count == 0) {
+        dx_free(tmp);
+        return NULL;
+    }
+
+    DxStyleBag *bag = (DxStyleBag *)dx_malloc(sizeof(DxStyleBag));
+    if (!bag) { dx_free(tmp); return NULL; }
+
+    // Copy to exact-size array
+    bag->entries = (DxStyleEntry *)dx_malloc(sizeof(DxStyleEntry) * tmp_count);
+    if (!bag->entries) { dx_free(bag); dx_free(tmp); return NULL; }
+    memcpy(bag->entries, tmp, sizeof(DxStyleEntry) * tmp_count);
+    bag->entry_count = tmp_count;
+    bag->parent_id = first_parent;
+    dx_free(tmp);
+
+    DX_DEBUG(TAG, "Resolved style 0x%08x: %u attrs (depth %u)",
+             style_res_id, tmp_count, depth);
+    return bag;
+}
+
+void dx_style_bag_free(DxStyleBag *bag) {
+    if (!bag) return;
+    dx_free(bag->entries);
+    dx_free(bag);
+}
+
+const DxStyleEntry *dx_style_bag_find_attr(const DxStyleBag *bag, uint32_t attr_id) {
+    if (!bag) return NULL;
+    for (uint32_t i = 0; i < bag->entry_count; i++) {
+        if (bag->entries[i].attr_id == attr_id) {
+            return &bag->entries[i];
+        }
+    }
+    return NULL;
+}
+
+// ============================================================
+// Theme
+// ============================================================
+
+DxTheme *dx_theme_create(const DxResources *res, uint32_t theme_res_id) {
+    if (!res || theme_res_id == 0) return NULL;
+
+    DxStyleBag *bag = dx_resources_resolve_style(res, theme_res_id);
+    if (!bag) {
+        DX_WARN(TAG, "Could not resolve theme style 0x%08x", theme_res_id);
+        return NULL;
+    }
+
+    DxTheme *theme = (DxTheme *)dx_malloc(sizeof(DxTheme));
+    if (!theme) { dx_style_bag_free(bag); return NULL; }
+
+    theme->theme_res_id = theme_res_id;
+    theme->bag = bag;
+
+    DX_INFO(TAG, "Theme created: 0x%08x with %u attributes", theme_res_id, bag->entry_count);
+    return theme;
+}
+
+void dx_theme_free(DxTheme *theme) {
+    if (!theme) return;
+    dx_style_bag_free(theme->bag);
+    dx_free(theme);
+}
+
+const DxStyleEntry *dx_theme_resolve_attr(const DxTheme *theme, uint32_t attr_id) {
+    if (!theme || !theme->bag) return NULL;
+    return dx_style_bag_find_attr(theme->bag, attr_id);
 }

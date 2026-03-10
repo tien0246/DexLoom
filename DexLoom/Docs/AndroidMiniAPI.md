@@ -2,143 +2,125 @@
 
 ## Overview
 
-DexLoom reimplements a tiny subset of the Android framework as native C functions.
-When guest bytecode calls an Android API method, the interpreter dispatches to these
-C implementations instead of actual Android framework code.
+DexLoom reimplements **400+ Android/Java/third-party classes** as native C functions.
+When guest bytecode calls an API method, the interpreter dispatches to these C implementations
+instead of actual framework code. Classes span the Android SDK, Java standard library,
+Kotlin stdlib, and popular third-party libraries.
 
-## Supported Classes
+## Class Categories
 
-### android.app.Activity
+### android.app (Activity, Service, Fragment, Application)
+- **Activity**: Full lifecycle (onCreate through onDestroy), setContentView, findViewById, startActivity/startActivityForResult, finish, onBackPressed, onSaveInstanceState/onRestoreInstanceState, recreate(), onCreateOptionsMenu/onOptionsItemSelected, onActivityResult
+- **Fragment**: onCreateView, onViewCreated, onStart, onResume lifecycle
+- **Service**: startService -> onCreate -> onStartCommand; IntentService subclass
+- **Application**: onCreate, getApplicationContext
 
-**Purpose**: Entry point for an Android screen. Manages lifecycle and content view.
+### android.content (Context, Intent, BroadcastReceiver, ContentProvider)
+- **Context**: getResources, getString, getSystemService, checkSelfPermission (safe vs dangerous), requestPermissions, getApplicationInfo, getClassLoader, bindService, openFileInput/openFileOutput, getExternalFilesDir
+- **Intent**: Constructor with action/class, putExtra/getExtra for all types, setAction, setData
+- **BroadcastReceiver**: registerReceiver/sendBroadcast with Intent action dispatch
+- **ContentProvider/ContentResolver**: Stub CRUD (query/insert/update/delete)
+- **SharedPreferences**: getString/putString/getInt/putInt with apply/commit
 
-**Supported Methods**:
-| Method | Signature | Implementation |
-|--------|-----------|----------------|
-| `<init>()` | `()V` | Allocate Activity object, init fields |
-| `onCreate(Bundle)` | `(Landroid/os/Bundle;)V` | Set lifecycle state, call super |
-| `setContentView(int)` | `(I)V` | Parse layout resource, build UI tree |
-| `findViewById(int)` | `(I)Landroid/view/View;` | Search UI tree for view with matching ID |
-| `getResources()` | `()Landroid/content/res/Resources;` | Return Resources singleton |
+### android.view (View, ViewGroup, Menu, MotionEvent)
+- **View**: setOnClickListener (all view types), setOnLongClickListener, setVisibility, getId, setTag/getTag, setPadding, setBackground, invalidate
+- **ViewGroup**: addView, removeView, getChildCount, getChildAt
+- **Menu/MenuItem/SubMenu/MenuInflater**: Full menu system
+- **MotionEvent**: Touch event dispatch with action types
 
-**Unsupported**: onStart, onResume, onPause, onStop, onDestroy, onSaveInstanceState,
-startActivity, finish, getIntent, all other lifecycle methods.
+### android.widget (30+ view types)
+- **Text**: TextView, EditText (with SwiftUI TextField binding), AutoCompleteTextView
+- **Buttons**: Button, ImageButton, ToggleButton, FloatingActionButton
+- **Compound**: CheckBox, Switch, RadioButton, RadioGroup (isChecked/setChecked/toggle)
+- **Lists**: RecyclerView (adapter pattern), ListView, GridView, Spinner
+- **Input**: SeekBar, RatingBar, SearchView
+- **Display**: ImageView (with drawable loading from APK), ProgressBar, WebView (WKWebView bridge)
+- **Layout**: LinearLayout, RelativeLayout, FrameLayout, ConstraintLayout (basic solver), ScrollView, NestedScrollView, CoordinatorLayout, SwipeRefreshLayout
+- **Navigation**: TabLayout, ViewPager, BottomNavigationView, Toolbar, DrawerLayout
+- **Material**: Chip, ChipGroup, CardView, Snackbar, TextInputLayout
 
-**iOS Mapping**: Activity maps to the RuntimeView screen in the SwiftUI app.
+### android.os
+- **Bundle**: Full get/put for all types
+- **Handler/Looper**: Post and delayed message dispatch
+- **Build/VERSION**: SDK_INT=33, RELEASE="13", MANUFACTURER/MODEL/DEVICE
+- **Environment**: getExternalStorageDirectory and related paths
 
-### android.view.View
+### android.content.res
+- **Resources**: getString, getLayout, getDimension, getDrawable, getColor
+- **AssetManager**: open() extracts files from APK; returns InputStream with real read/available/close
+- **Configuration**: Device configuration data
 
-**Purpose**: Base class for all UI elements.
+### android.animation
+- ViewPropertyAnimator, ValueAnimator, ObjectAnimator, AnimatorSet stubs
 
-**Supported Methods**:
-| Method | Signature | Implementation |
-|--------|-----------|----------------|
-| `setOnClickListener(OnClickListener)` | `(Landroid/view/View$OnClickListener;)V` | Store listener ref on view node |
-| `setVisibility(int)` | `(I)V` | Update visibility in UI tree |
-| `getId()` | `()I` | Return view ID |
+### androidx / Jetpack
+- **LiveData/MutableLiveData**: setValue notifies observers, observe with lifecycle
+- **ViewModel/ViewModelProvider**: ViewModelProvider.get instantiates ViewModel subclass
+- **RecyclerView**: Full adapter pattern with ViewHolder
 
-**Unsupported**: setLayoutParams, measure, layout, draw, invalidate, requestLayout,
-setBackground, setPadding, all touch/gesture handling beyond click.
+### java.lang
+- **Object**: equals, hashCode, toString, getClass (returns Class object), clone, notify/wait
+- **String**: 35+ methods (substring, indexOf, replace, replaceAll, split, trim, toLowerCase, toUpperCase, format, valueOf, join, getBytes, intern, matches, equalsIgnoreCase, codePointAt, etc.)
+- **Class**: forName, getName, isInterface, getSuperclass, isArray, getAnnotation, getDeclaredMethods, getDeclaredFields
+- **Thread**: currentThread, start (cooperative/synchronous), getName, setName, sleep
+- **Enum**: name, ordinal, compareTo, values, valueOf
+- **Number/Math**: Integer, Long, Float, Double, Boolean, Byte, Short, Character with valueOf/parse/unboxing
+- **Throwable/Exception**: getMessage, toString, getCause, printStackTrace, getStackTrace
 
-**iOS Mapping**: Base protocol for SwiftUI view generation.
+### java.lang.reflect
+- **Method**: invoke with real dispatch, getName, getParameterTypes
+- **Field**: get/set with real field access, getName
+- **Constructor**: newInstance
+- **Proxy**: newProxyInstance with InvocationHandler dispatch
+- **Array**: newInstance, get, set, getLength
 
-### android.widget.TextView
+### java.util
+- **ArrayList**: Full implementation with real Iterator (hasNext/next for for-each loops)
+- **HashMap**: get/put/remove/containsKey/containsValue/putAll/getOrDefault/putIfAbsent/toString; keySet/values/entrySet return iterable collections
+- **HashSet, LinkedHashMap, TreeMap**: Basic operations
+- **Collections**: emptyList/emptyMap, singleton/singletonMap, addAll, sort, unmodifiableList
+- **Arrays**: asList, copyOf, fill, equals, toString
+- **Objects**: equals, hashCode, requireNonNull, toString
 
-**Purpose**: Displays text.
+### java.io
+- **File**: createTempFile, exists, getName, getAbsolutePath, length, delete, mkdir, listFiles
+- **InputStream/OutputStream**: Real read/write/close with byte buffer backing
+- **BufferedReader/InputStreamReader**: readLine, read, close
 
-**Supported Methods**:
-| Method | Signature | Implementation |
-|--------|-----------|----------------|
-| `<init>(Context)` | `(Landroid/content/Context;)V` | Create text view node |
-| `setText(CharSequence)` | `(Ljava/lang/CharSequence;)V` | Update text in UI tree, trigger re-render |
-| `getText()` | `()Ljava/lang/CharSequence;` | Return current text |
-| `setTextSize(float)` | `(F)V` | Update font size attribute |
+### java.nio
+- **ByteBuffer**: Field-backed storage with position/limit/capacity, get/put, multi-byte ops, byte order
 
-**Unsupported**: setTextColor, setTypeface, setGravity, setLines, ellipsize,
-all Spannable/Editable methods.
+### java.lang.ref
+- **WeakReference/SoftReference**: Extend Reference; get/clear/enqueue
+- **ReferenceQueue**: Stub
 
-**iOS Mapping**: SwiftUI `Text` view.
+### java.util.concurrent
+- **ExecutorService**: submit/execute (cooperative)
+- **Future**: get (returns immediately)
+- **CompletableFuture**: thenApply/thenAccept/thenCompose stubs
 
-### android.widget.Button
+### Third-Party Libraries
 
-**Purpose**: Clickable button (extends TextView).
+#### RxJava3 (11 classes, 85 methods)
+- Observable, Single, Completable, Maybe, Flowable
+- Operators: map, flatMap, filter, subscribeOn, observeOn, subscribe
+- Disposable, CompositeDisposable, Schedulers
 
-**Supported Methods**: Inherits all TextView methods plus OnClickListener from View.
+#### OkHttp3 (18 classes, 120 methods)
+- OkHttpClient, Request, Request.Builder, Response, Response.Builder
+- Call, Callback, Interceptor, MediaType, RequestBody, ResponseBody
+- Headers, HttpUrl, Cache, ConnectionPool, Dispatcher
 
-**iOS Mapping**: SwiftUI `Button` with text label.
+#### Retrofit2 (12 classes, 50 methods)
+- Retrofit, Retrofit.Builder, Call, Callback, Response
+- Converter, GsonConverterFactory, RxJava3CallAdapterFactory
+- HTTP method annotations (@GET, @POST, @PUT, @DELETE)
 
-### android.view.ViewGroup
+#### Glide (6 classes, 40 methods)
+- Glide, RequestManager, RequestBuilder, RequestOptions
+- Target, DrawableTransitionOptions
 
-**Purpose**: Container for child views.
-
-**Supported Methods**:
-| Method | Signature | Implementation |
-|--------|-----------|----------------|
-| `addView(View)` | `(Landroid/view/View;)V` | Append child to UI tree node |
-| `removeView(View)` | `(Landroid/view/View;)V` | Remove child from UI tree node |
-| `getChildCount()` | `()I` | Return child count |
-| `getChildAt(int)` | `(I)Landroid/view/View;` | Return child at index |
-
-**Unsupported**: LayoutParams, margins, all measurement/layout passes.
-
-**iOS Mapping**: SwiftUI container (VStack/HStack).
-
-### android.widget.LinearLayout
-
-**Purpose**: Arranges children in a line.
-
-**Supported Methods**:
-| Method | Signature | Implementation |
-|--------|-----------|----------------|
-| `<init>(Context)` | `(Landroid/content/Context;)V` | Create layout node |
-| `setOrientation(int)` | `(I)V` | Set VERTICAL(1) or HORIZONTAL(0) |
-
-**Unsupported**: gravity, weight, dividers.
-
-**iOS Mapping**: SwiftUI `VStack` (vertical) or `HStack` (horizontal).
-
-### android.content.Context
-
-**Purpose**: Abstract access to app resources and environment.
-
-**Supported Methods**:
-| Method | Signature | Implementation |
-|--------|-----------|----------------|
-| `getResources()` | `()Landroid/content/res/Resources;` | Return Resources singleton |
-| `getString(int)` | `(I)Ljava/lang/String;` | Look up string resource |
-
-**Unsupported**: Everything else (startActivity, getSystemService, getPackageName, etc.).
-
-### android.content.res.Resources
-
-**Purpose**: Access to parsed app resources.
-
-**Supported Methods**:
-| Method | Signature | Implementation |
-|--------|-----------|----------------|
-| `getString(int)` | `(I)Ljava/lang/String;` | Look up by resource ID |
-| `getLayout(int)` | `(I)Landroid/content/res/XmlResourceParser;` | Return layout XML |
-
-**Unsupported**: getDrawable, getColor, getDimension, getInteger, all typed arrays.
-
-### android.os.Bundle
-
-**Purpose**: Key-value map for passing data.
-
-**Supported Methods**:
-| Method | Signature | Implementation |
-|--------|-----------|----------------|
-| `<init>()` | `()V` | Create empty bundle |
-
-**Unsupported**: All get/put methods (v1 passes null Bundle to onCreate).
-
-### android.view.View.OnClickListener (interface)
-
-**Purpose**: Callback for click events.
-
-**Supported Methods**:
-| Method | Signature | Implementation |
-|--------|-----------|----------------|
-| `onClick(View)` | `(Landroid/view/View;)V` | Dispatch to guest bytecode |
-
-**iOS Mapping**: SwiftUI Button action closure that sends event back to C runtime.
+### Utility
+- **android.util.Log**: d/i/w/e/v with tag+message logging
+- **android.util.Pair**: Field-backed first/second, create() factory
+- **ClassLoader**: loadClass, getParent, getResource

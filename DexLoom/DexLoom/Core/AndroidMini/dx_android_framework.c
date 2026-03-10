@@ -25,9 +25,19 @@ static DxResult native_class_new_instance(DxVM *vm, DxFrame *frame, DxValue *arg
 static DxResult native_class_is_assignable_from(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
 static DxResult native_class_get_declared_field(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
 static DxResult native_class_get_declared_method(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_class_get_declared_methods_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_class_get_declared_fields_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_class_get_annotation_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_class_is_annotation_present_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_class_get_annotations_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
 static DxResult native_method_invoke(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_method_get_annotation_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_method_is_annotation_present_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_method_get_annotations_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_method_get_name_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
 static DxResult native_field_get(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
 static DxResult native_field_set(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
+static DxResult native_field_get_name_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count);
 
 // ============================================================
 // Activity native methods
@@ -428,6 +438,54 @@ static DxResult native_view_set_on_click_listener(DxVM *vm, DxFrame *frame,
 
     self->ui_node->click_listener = listener;
     DX_DEBUG(TAG, "OnClickListener set for view 0x%x", self->ui_node->view_id);
+    return DX_OK;
+}
+
+static DxResult native_view_set_on_long_click_listener(DxVM *vm, DxFrame *frame,
+                                                        DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame; (void)arg_count;
+    DxObject *self = args[0].obj;
+    DxObject *listener = (arg_count > 1) ? args[1].obj : NULL;
+
+    if (!self || !self->ui_node) {
+        DX_WARN(TAG, "setOnLongClickListener on object without UI node");
+        return DX_OK;
+    }
+
+    self->ui_node->long_click_listener = listener;
+    DX_DEBUG(TAG, "OnLongClickListener set for view 0x%x", self->ui_node->view_id);
+    return DX_OK;
+}
+
+static DxResult native_view_set_on_touch_listener(DxVM *vm, DxFrame *frame,
+                                                    DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame; (void)arg_count;
+    DxObject *self = args[0].obj;
+    DxObject *listener = (arg_count > 1) ? args[1].obj : NULL;
+
+    if (!self || !self->ui_node) {
+        DX_WARN(TAG, "setOnTouchListener on object without UI node");
+        return DX_OK;
+    }
+
+    self->ui_node->touch_listener = listener;
+    DX_DEBUG(TAG, "OnTouchListener set for view 0x%x", self->ui_node->view_id);
+    return DX_OK;
+}
+
+static DxResult native_swipe_refresh_set_on_refresh_listener(DxVM *vm, DxFrame *frame,
+                                                              DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame; (void)arg_count;
+    DxObject *self = args[0].obj;
+    DxObject *listener = (arg_count > 1) ? args[1].obj : NULL;
+
+    if (!self || !self->ui_node) {
+        DX_WARN(TAG, "setOnRefreshListener on object without UI node");
+        return DX_OK;
+    }
+
+    self->ui_node->refresh_listener = listener;
+    DX_DEBUG(TAG, "OnRefreshListener set for view 0x%x", self->ui_node->view_id);
     return DX_OK;
 }
 
@@ -2775,6 +2833,99 @@ static DxResult native_return_int_10000(DxVM *vm, DxFrame *frame, DxValue *args,
 static DxResult native_return_int_200(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
     (void)vm; (void)args; (void)arg_count;
     frame->result = DX_INT_VALUE(200);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_return_int_10(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)args; (void)arg_count;
+    frame->result = DX_INT_VALUE(10);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_return_int_15(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)args; (void)arg_count;
+    frame->result = DX_INT_VALUE(15);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// MediaPlayer.create(Context, int) → allocate MediaPlayer and return it
+static DxResult native_mediaplayer_create(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    DxClass *mp_cls = dx_vm_find_class(vm, "Landroid/media/MediaPlayer;");
+    if (!mp_cls) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+    DxObject *mp = dx_vm_alloc_object(vm, mp_cls);
+    frame->result = mp ? DX_OBJ_VALUE(mp) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// SoundPool.load() → return sound ID 1
+static DxResult native_soundpool_load(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)args; (void)arg_count;
+    frame->result = DX_INT_VALUE(1);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// SoundPool.play() → return stream ID 1
+static DxResult native_soundpool_play(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)args; (void)arg_count;
+    frame->result = DX_INT_VALUE(1);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// SoundPool.Builder.build() → allocate SoundPool and return it
+static DxResult native_soundpool_builder_build(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    DxClass *sp_cls = dx_vm_find_class(vm, "Landroid/media/SoundPool;");
+    if (!sp_cls) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+    DxObject *sp = dx_vm_alloc_object(vm, sp_cls);
+    frame->result = sp ? DX_OBJ_VALUE(sp) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// AudioAttributes.Builder.build() → allocate AudioAttributes and return it
+static DxResult native_audio_attr_builder_build(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    DxClass *aa_cls = dx_vm_find_class(vm, "Landroid/media/AudioAttributes;");
+    if (!aa_cls) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+    DxObject *aa = dx_vm_alloc_object(vm, aa_cls);
+    frame->result = aa ? DX_OBJ_VALUE(aa) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// RingtoneManager.getRingtone(Context, Uri) → allocate Ringtone and return it
+static DxResult native_ringtone_manager_get_ringtone(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    DxClass *rt_cls = dx_vm_find_class(vm, "Landroid/media/Ringtone;");
+    if (!rt_cls) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+    DxObject *rt = dx_vm_alloc_object(vm, rt_cls);
+    frame->result = rt ? DX_OBJ_VALUE(rt) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// RingtoneManager.getDefaultUri(int) → return a Uri object
+static DxResult native_ringtone_manager_get_default_uri(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    DxClass *uri_cls = dx_vm_find_class(vm, "Landroid/net/Uri;");
+    if (!uri_cls) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+    DxObject *uri = dx_vm_alloc_object(vm, uri_cls);
+    frame->result = uri ? DX_OBJ_VALUE(uri) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// AudioManager.requestAudioFocus → return AUDIOFOCUS_REQUEST_GRANTED (1)
+static DxResult native_audio_focus_granted(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)args; (void)arg_count;
+    frame->result = DX_INT_VALUE(1); // AUDIOFOCUS_REQUEST_GRANTED
     frame->has_result = true;
     return DX_OK;
 }
@@ -5702,6 +5853,119 @@ static DxResult native_context_get_cache_dir(DxVM *vm, DxFrame *frame, DxValue *
     return DX_OK;
 }
 
+// Context.getExternalFilesDir(type) — return File with iOS-mapped path
+static DxResult native_context_get_external_files_dir(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    // args[0] = this (Context), args[1] = type (String or null)
+    const char *type = NULL;
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        type = dx_vm_get_string_value(args[1].obj);
+    }
+    char path[256];
+    if (type && type[0]) {
+        snprintf(path, sizeof(path), "/sdcard/Android/data/app/files/%s", type);
+    } else {
+        snprintf(path, sizeof(path), "/sdcard/Android/data/app/files");
+    }
+    DxObject *file_obj = create_file_object(vm, path);
+    frame->result = file_obj ? DX_OBJ_VALUE(file_obj) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// Permission helpers
+// ============================================================
+
+// Check if a permission is "safe" (auto-granted)
+static bool is_safe_permission(const char *perm) {
+    if (!perm) return false;
+    if (strcmp(perm, "android.permission.INTERNET") == 0) return true;
+    if (strcmp(perm, "android.permission.ACCESS_NETWORK_STATE") == 0) return true;
+    if (strcmp(perm, "android.permission.ACCESS_WIFI_STATE") == 0) return true;
+    if (strcmp(perm, "android.permission.VIBRATE") == 0) return true;
+    if (strcmp(perm, "android.permission.WAKE_LOCK") == 0) return true;
+    if (strcmp(perm, "android.permission.RECEIVE_BOOT_COMPLETED") == 0) return true;
+    if (strcmp(perm, "android.permission.FOREGROUND_SERVICE") == 0) return true;
+    if (strcmp(perm, "android.permission.SET_ALARM") == 0) return true;
+    if (strcmp(perm, "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS") == 0) return true;
+    if (strcmp(perm, "android.permission.NFC") == 0) return true;
+    if (strcmp(perm, "android.permission.BLUETOOTH") == 0) return true;
+    if (strcmp(perm, "android.permission.BLUETOOTH_ADMIN") == 0) return true;
+    return false;
+}
+
+// Context.checkSelfPermission(permission) — GRANTED for safe, DENIED for dangerous
+static DxResult native_check_self_permission(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    // args[0] = this, args[1] = permission string
+    const char *perm = NULL;
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        perm = dx_vm_get_string_value(args[1].obj);
+    }
+    int result = is_safe_permission(perm) ? 0 : -1; // 0=GRANTED, -1=DENIED
+    frame->result = DX_INT_VALUE(result);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ContextCompat.checkSelfPermission(context, permission) — static version
+static DxResult native_compat_check_permission(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    // args[0] = context, args[1] = permission string
+    const char *perm = NULL;
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        perm = dx_vm_get_string_value(args[1].obj);
+    }
+    int result = is_safe_permission(perm) ? 0 : -1;
+    frame->result = DX_INT_VALUE(result);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Activity.requestPermissions(String[], int) — call onRequestPermissionsResult with all GRANTED
+static DxResult native_activity_request_permissions(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)frame;
+    // args[0] = this (Activity), args[1] = String[] permissions, args[2] = requestCode
+    DxObject *activity = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxObject *perms_arr = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? args[1].obj : NULL;
+    int32_t request_code = (arg_count > 2 && args[2].tag == DX_VAL_INT) ? args[2].i : 0;
+
+    if (!activity || !activity->klass) return DX_OK;
+
+    // Build grantResults array — all PERMISSION_GRANTED (0)
+    uint32_t perm_count = (perms_arr && perms_arr->is_array) ? perms_arr->array_length : 0;
+    DxObject *grant_arr = dx_vm_alloc_array(vm, perm_count);
+    if (grant_arr) {
+        for (uint32_t i = 0; i < perm_count; i++) {
+            grant_arr->array_elements[i] = DX_INT_VALUE(0); // PERMISSION_GRANTED
+        }
+    }
+
+    // Call onRequestPermissionsResult(requestCode, permissions, grantResults)
+    DxMethod *callback = dx_vm_find_method(activity->klass, "onRequestPermissionsResult", NULL);
+    if (callback) {
+        DX_INFO(TAG, "requestPermissions: delivering onRequestPermissionsResult(requestCode=%d, count=%u)",
+                request_code, perm_count);
+        vm->insn_count = 0;
+        vm->pending_exception = NULL;
+        DxValue cb_args[4] = {
+            DX_OBJ_VALUE(activity),
+            DX_INT_VALUE(request_code),
+            perms_arr ? DX_OBJ_VALUE(perms_arr) : DX_NULL_VALUE,
+            grant_arr ? DX_OBJ_VALUE(grant_arr) : DX_NULL_VALUE
+        };
+        dx_vm_execute_method(vm, callback, cb_args, 4, NULL);
+        if (vm->pending_exception) vm->pending_exception = NULL;
+    }
+    return DX_OK;
+}
+
+// ActivityCompat.requestPermissions(activity, permissions, requestCode) — static version
+static DxResult native_compat_request_permissions(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    return native_activity_request_permissions(vm, frame, args, arg_count);
+}
+
 // Context.getSharedPreferences — return SharedPreferences object
 static DxResult native_context_get_shared_prefs(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
     (void)args; (void)arg_count;
@@ -8234,6 +8498,109 @@ static DxResult native_looper_get_thread(DxVM *vm, DxFrame *frame, DxValue *args
     return DX_OK;
 }
 
+// ============================================================
+// WebView native methods
+// ============================================================
+
+static DxResult native_webview_load_url(DxVM *vm, DxFrame *frame,
+                                         DxValue *args, uint32_t arg_count) {
+    (void)frame; (void)arg_count;
+    DxObject *self = args[0].obj;
+    DxObject *url_obj = (arg_count > 1) ? args[1].obj : NULL;
+
+    if (!self || !self->ui_node) {
+        DX_WARN(TAG, "loadUrl on WebView without UI node");
+        return DX_OK;
+    }
+
+    const char *url = "";
+    if (url_obj) {
+        url = dx_vm_get_string_value(url_obj);
+        if (!url) url = "";
+    }
+
+    dx_free(self->ui_node->web_url);
+    self->ui_node->web_url = dx_strdup(url);
+    // Clear any previous HTML content since we're loading a URL
+    dx_free(self->ui_node->web_html);
+    self->ui_node->web_html = NULL;
+    DX_INFO(TAG, "WebView.loadUrl(\"%s\") on view 0x%x", url, self->ui_node->view_id);
+
+    rebuild_render_model(vm);
+    return DX_OK;
+}
+
+static DxResult native_webview_load_data(DxVM *vm, DxFrame *frame,
+                                          DxValue *args, uint32_t arg_count) {
+    (void)frame; (void)arg_count;
+    DxObject *self = args[0].obj;
+    DxObject *data_obj = (arg_count > 1) ? args[1].obj : NULL;
+
+    if (!self || !self->ui_node) {
+        DX_WARN(TAG, "loadData on WebView without UI node");
+        return DX_OK;
+    }
+
+    const char *data = "";
+    if (data_obj) {
+        data = dx_vm_get_string_value(data_obj);
+        if (!data) data = "";
+    }
+
+    dx_free(self->ui_node->web_html);
+    self->ui_node->web_html = dx_strdup(data);
+    // Clear any previous URL since we're loading HTML directly
+    dx_free(self->ui_node->web_url);
+    self->ui_node->web_url = NULL;
+    DX_INFO(TAG, "WebView.loadData() on view 0x%x (%zu bytes)", self->ui_node->view_id, strlen(data));
+
+    rebuild_render_model(vm);
+    return DX_OK;
+}
+
+static DxResult native_webview_load_data_with_base(DxVM *vm, DxFrame *frame,
+                                                     DxValue *args, uint32_t arg_count) {
+    // loadDataWithBaseURL(baseUrl, data, mimeType, encoding, historyUrl)
+    // We only care about the data (arg 2)
+    (void)frame;
+    DxObject *self = args[0].obj;
+    DxObject *data_obj = (arg_count > 2) ? args[2].obj : NULL;
+
+    if (!self || !self->ui_node) {
+        DX_WARN(TAG, "loadDataWithBaseURL on WebView without UI node");
+        return DX_OK;
+    }
+
+    const char *data = "";
+    if (data_obj) {
+        data = dx_vm_get_string_value(data_obj);
+        if (!data) data = "";
+    }
+
+    dx_free(self->ui_node->web_html);
+    self->ui_node->web_html = dx_strdup(data);
+    dx_free(self->ui_node->web_url);
+    self->ui_node->web_url = NULL;
+    DX_INFO(TAG, "WebView.loadDataWithBaseURL() on view 0x%x", self->ui_node->view_id);
+
+    rebuild_render_model(vm);
+    return DX_OK;
+}
+
+static DxResult native_webview_get_settings(DxVM *vm, DxFrame *frame,
+                                              DxValue *args, uint32_t arg_count) {
+    (void)arg_count; (void)args;
+    DxClass *settings_cls = dx_vm_find_class(vm, "Landroid/webkit/WebSettings;");
+    if (settings_cls) {
+        DxObject *settings = dx_vm_alloc_object(vm, settings_cls);
+        frame->result = settings ? DX_OBJ_VALUE(settings) : DX_NULL_VALUE;
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
 DxResult dx_register_android_framework(DxVM *vm) {
     if (!vm) return DX_ERR_NULL_PTR;
 
@@ -8287,13 +8654,13 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(context_cls, "getClassLoader", "L", DX_ACC_PUBLIC,
                native_context_get_class_loader, false);
     add_method(context_cls, "getExternalFilesDir", "LL", DX_ACC_PUBLIC,
-               native_context_get_files_dir, false);
+               native_context_get_external_files_dir, false);
     add_method(context_cls, "getApplicationInfo", "L", DX_ACC_PUBLIC,
                native_context_get_app_info, false);
     add_method(context_cls, "bindService", "ZLLI", DX_ACC_PUBLIC,
                native_context_bind_service, false);
     add_method(context_cls, "checkSelfPermission", "IL", DX_ACC_PUBLIC,
-               native_return_int_zero, false); // PERMISSION_GRANTED = 0
+               native_check_self_permission, false);
 
     // android.app.Activity (extends Context)
     DxClass *activity_cls = reg_class(vm, "Landroid/app/Activity;", context_cls);
@@ -8358,6 +8725,8 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_return_false, false);
     add_method(activity_cls, "onRequestPermissionsResult", "VILL", DX_ACC_PUBLIC,
                native_noop, false);
+    add_method(activity_cls, "requestPermissions", "VLI", DX_ACC_PUBLIC,
+               native_activity_request_permissions, false);
     add_method(activity_cls, "onSaveInstanceState", "VL", DX_ACC_PROTECTED,
                native_activity_on_save_instance_state, false);
     add_method(activity_cls, "onRestoreInstanceState", "VL", DX_ACC_PROTECTED,
@@ -8526,6 +8895,14 @@ DxResult dx_register_android_framework(DxVM *vm) {
     onclick_cls->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
     vm->class_onclick = onclick_cls;
 
+    // android.view.View$OnLongClickListener (interface)
+    DxClass *onlongclick_cls = reg_class(vm, "Landroid/view/View$OnLongClickListener;", obj);
+    onlongclick_cls->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+
+    // android.view.View$OnTouchListener (interface)
+    DxClass *ontouch_cls = reg_class(vm, "Landroid/view/View$OnTouchListener;", obj);
+    ontouch_cls->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+
     // android.widget.EditText (extends TextView)
     DxClass *edittext_cls = reg_class(vm, "Landroid/widget/EditText;", textview_cls);
     vm->class_edittext = edittext_cls;
@@ -8651,6 +9028,11 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_return_false, false);
     add_method(pm_cls, "getPackageInfo", "LLI", DX_ACC_PUBLIC,
                native_return_null, false);
+    {
+        const char *pm_names[] = { "PERMISSION_GRANTED", "PERMISSION_DENIED" };
+        DxValue pm_vals[] = { DX_INT_VALUE(0), DX_INT_VALUE(-1) };
+        add_static_fields(pm_cls, pm_names, pm_vals, 2);
+    }
 
     // android.net.Uri
     DxClass *uri_cls = reg_class(vm, "Landroid/net/Uri;", obj);
@@ -8677,7 +9059,7 @@ DxResult dx_register_android_framework(DxVM *vm) {
     // android.media.RingtoneManager
     DxClass *rm_cls = reg_class(vm, "Landroid/media/RingtoneManager;", obj);
     add_method(rm_cls, "getDefaultUri", "LI", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_null, true);
+               native_ringtone_manager_get_default_uri, true);
 
     // android.os.Handler
     DxClass *handler_cls = reg_class(vm, "Landroid/os/Handler;", obj);
@@ -8713,6 +9095,18 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_noop, false);
     add_method(msgqueue_cls, "removeIdleHandler", "VL", DX_ACC_PUBLIC,
                native_noop, false);
+
+    // android.os.HandlerThread (extends Thread, provides Looper)
+    DxClass *handler_thread_cls = reg_class(vm, "Landroid/os/HandlerThread;", obj);
+    add_method(handler_thread_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    add_method(handler_thread_cls, "<init>", "VLI", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    add_method(handler_thread_cls, "start", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(handler_thread_cls, "getLooper", "L", DX_ACC_PUBLIC,
+               native_looper_get_main_looper, false);
+    add_method(handler_thread_cls, "quit", "Z", DX_ACC_PUBLIC, native_return_true, false);
+    add_method(handler_thread_cls, "quitSafely", "Z", DX_ACC_PUBLIC, native_return_true, false);
 
     // --- AndroidX / AppCompat stubs ---
 
@@ -10059,9 +10453,9 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(view_cls, "getResources", "L", DX_ACC_PUBLIC,
                native_context_get_resources, false);
     add_method(view_cls, "setOnTouchListener", "VL", DX_ACC_PUBLIC,
-               native_noop, false);
+               native_view_set_on_touch_listener, false);
     add_method(view_cls, "setOnLongClickListener", "VL", DX_ACC_PUBLIC,
-               native_noop, false);
+               native_view_set_on_long_click_listener, false);
     add_method(view_cls, "isEnabled", "Z", DX_ACC_PUBLIC,
                native_return_true, false);
     add_method(view_cls, "requestFocus", "Z", DX_ACC_PUBLIC,
@@ -10313,7 +10707,7 @@ DxResult dx_register_android_framework(DxVM *vm) {
                    native_return_false, true);
     }
 
-    // Class: forName, getDeclaredField
+    // Class: forName, getDeclaredField, reflection
     DxClass *class_cls_fw = dx_vm_find_class(vm, "Ljava/lang/Class;");
     if (class_cls_fw) {
         class_cls_fw->instance_field_count = 1;  // field[0] = DxClass* (as int)
@@ -10324,13 +10718,22 @@ DxResult dx_register_android_framework(DxVM *vm) {
         add_method(class_cls_fw, "getDeclaredMethod", "LLL", DX_ACC_PUBLIC,
                    native_class_get_declared_method, false);
         add_method(class_cls_fw, "getDeclaredFields", "L", DX_ACC_PUBLIC,
-                   native_return_null, false);
+                   native_class_get_declared_fields_fw, false);
         add_method(class_cls_fw, "getDeclaredMethods", "L", DX_ACC_PUBLIC,
-                   native_return_null, false);
+                   native_class_get_declared_methods_fw, false);
         add_method(class_cls_fw, "isAssignableFrom", "ZL", DX_ACC_PUBLIC,
                    native_class_is_assignable_from, false);
         add_method(class_cls_fw, "newInstance", "L", DX_ACC_PUBLIC,
                    native_class_new_instance, false);
+        // Annotation support (real implementations)
+        add_method(class_cls_fw, "getAnnotation", "LL", DX_ACC_PUBLIC,
+                   native_class_get_annotation_fw, false);
+        add_method(class_cls_fw, "getAnnotations", "L", DX_ACC_PUBLIC,
+                   native_class_get_annotations_fw, false);
+        add_method(class_cls_fw, "getDeclaredAnnotations", "L", DX_ACC_PUBLIC,
+                   native_class_get_annotations_fw, false);
+        add_method(class_cls_fw, "isAnnotationPresent", "ZL", DX_ACC_PUBLIC,
+                   native_class_is_annotation_present_fw, false);
     }
 
     // List interface methods (commonly called via interface invoke)
@@ -10391,6 +10794,12 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_noop, false);
     add_method(field_cls, "getInt", "IL", DX_ACC_PUBLIC,
                native_return_int_zero, false);
+    add_method(field_cls, "getName", "L", DX_ACC_PUBLIC,
+               native_field_get_name_fw, false);
+    add_method(field_cls, "getType", "L", DX_ACC_PUBLIC,
+               native_return_null, false);
+    add_method(field_cls, "getModifiers", "I", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
 
     // java.lang.reflect.Method
     DxClass *method_cls = reg_class(vm, "Ljava/lang/reflect/Method;", obj);
@@ -10399,15 +10808,25 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_method_invoke, false);
     add_method(method_cls, "setAccessible", "VZ", DX_ACC_PUBLIC,
                native_noop, false);
-    // Annotation support stubs
+    // Real annotation support
     add_method(method_cls, "getAnnotation", "LL", DX_ACC_PUBLIC,
-               native_return_null, false);
+               native_method_get_annotation_fw, false);
     add_method(method_cls, "isAnnotationPresent", "ZL", DX_ACC_PUBLIC,
-               native_return_false, false);
+               native_method_is_annotation_present_fw, false);
+    add_method(method_cls, "getAnnotations", "L", DX_ACC_PUBLIC,
+               native_method_get_annotations_fw, false);
+    add_method(method_cls, "getDeclaredAnnotations", "L", DX_ACC_PUBLIC,
+               native_method_get_annotations_fw, false);
     add_method(method_cls, "getParameterTypes", "L", DX_ACC_PUBLIC,
                native_return_null, false);
     add_method(method_cls, "getReturnType", "L", DX_ACC_PUBLIC,
                native_return_null, false);
+    add_method(method_cls, "getName", "L", DX_ACC_PUBLIC,
+               native_method_get_name_fw, false);
+    add_method(method_cls, "getDeclaringClass", "L", DX_ACC_PUBLIC,
+               native_return_null, false);
+    add_method(method_cls, "getModifiers", "I", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
 
     // android.text.method.LinkMovementMethod
     DxClass *linkmm_cls = reg_class(vm, "Landroid/text/method/LinkMovementMethod;", obj);
@@ -10691,6 +11110,12 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(motion_event_cls, "getPointerId", "II", DX_ACC_PUBLIC, native_return_int_zero, false);
     add_method(motion_event_cls, "getActionMasked", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
     add_method(motion_event_cls, "getEventTime", "J", DX_ACC_PUBLIC, native_return_int_zero, false);
+    {
+        // MotionEvent action constants: ACTION_DOWN=0, ACTION_UP=1, ACTION_MOVE=2, ACTION_CANCEL=3
+        const char *me_names[] = { "ACTION_DOWN", "ACTION_UP", "ACTION_MOVE", "ACTION_CANCEL" };
+        DxValue me_vals[] = { DX_INT_VALUE(0), DX_INT_VALUE(1), DX_INT_VALUE(2), DX_INT_VALUE(3) };
+        add_static_fields(motion_event_cls, me_names, me_vals, 4);
+    }
 
     DxClass *key_event_cls = reg_class(vm, "Landroid/view/KeyEvent;", obj);
     add_method(key_event_cls, "getKeyCode", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
@@ -11051,18 +11476,52 @@ DxResult dx_register_android_framework(DxVM *vm) {
     DxClass *webview_cls = reg_class(vm, "Landroid/webkit/WebView;", viewgroup_cls);
     add_method(webview_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
-    add_method(webview_cls, "loadUrl", "VL", DX_ACC_PUBLIC, native_noop, false);
-    add_method(webview_cls, "getSettings", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(webview_cls, "loadUrl", "VL", DX_ACC_PUBLIC, native_webview_load_url, false);
+    add_method(webview_cls, "loadData", "VLLL", DX_ACC_PUBLIC, native_webview_load_data, false);
+    add_method(webview_cls, "loadDataWithBaseURL", "VLLLLL", DX_ACC_PUBLIC, native_webview_load_data_with_base, false);
+    add_method(webview_cls, "getSettings", "L", DX_ACC_PUBLIC, native_webview_get_settings, false);
     add_method(webview_cls, "setWebViewClient", "VL", DX_ACC_PUBLIC, native_noop, false);
     add_method(webview_cls, "setWebChromeClient", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(webview_cls, "canGoBack", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(webview_cls, "canGoForward", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(webview_cls, "goBack", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(webview_cls, "goForward", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(webview_cls, "reload", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(webview_cls, "stopLoading", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(webview_cls, "addJavascriptInterface", "VLL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(webview_cls, "evaluateJavascript", "VLL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(webview_cls, "setOnClickListener", "VL", DX_ACC_PUBLIC, native_view_set_on_click_listener, false);
 
     DxClass *webview_client_cls = reg_class(vm, "Landroid/webkit/WebViewClient;", obj);
     add_method(webview_client_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
+    add_method(webview_client_cls, "onPageStarted", "VLLL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(webview_client_cls, "onPageFinished", "VLL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(webview_client_cls, "shouldOverrideUrlLoading", "ZLL", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(webview_client_cls, "onReceivedError", "VLILL", DX_ACC_PUBLIC, native_noop, false);
+
+    DxClass *web_chrome_client_cls = reg_class(vm, "Landroid/webkit/WebChromeClient;", obj);
+    add_method(web_chrome_client_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(web_chrome_client_cls, "onProgressChanged", "VLI", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_chrome_client_cls, "onReceivedTitle", "VLL", DX_ACC_PUBLIC, native_noop, false);
 
     DxClass *web_settings_cls = reg_class(vm, "Landroid/webkit/WebSettings;", obj);
     add_method(web_settings_cls, "setJavaScriptEnabled", "VZ", DX_ACC_PUBLIC, native_noop, false);
     add_method(web_settings_cls, "setDomStorageEnabled", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setUserAgentString", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setLoadWithOverviewMode", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setUseWideViewPort", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setBuiltInZoomControls", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setDisplayZoomControls", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setSupportZoom", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setMediaPlaybackRequiresUserGesture", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setCacheMode", "VI", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setMixedContentMode", "VI", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setAllowFileAccess", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "setJavaScriptCanOpenWindowsAutomatically", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(web_settings_cls, "getUserAgentString", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(web_settings_cls, "getCacheMode", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
 
     DxClass *tablayout_cls = reg_class(vm, "Lcom/google/android/material/tabs/TabLayout;", viewgroup_cls);
     add_method(tablayout_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
@@ -11075,7 +11534,7 @@ DxResult dx_register_android_framework(DxVM *vm) {
     DxClass *fab_cls = reg_class(vm, "Lcom/google/android/material/floatingactionbutton/FloatingActionButton;", view_cls);
     add_method(fab_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
-    add_method(fab_cls, "setOnClickListener", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(fab_cls, "setOnClickListener", "VL", DX_ACC_PUBLIC, native_view_set_on_click_listener, false);
     add_method(fab_cls, "show", "V", DX_ACC_PUBLIC, native_noop, false);
     add_method(fab_cls, "hide", "V", DX_ACC_PUBLIC, native_noop, false);
 
@@ -11089,6 +11548,30 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_return_null, true);
     add_method(snackbar_cls, "show", "V", DX_ACC_PUBLIC, native_noop, false);
     add_method(snackbar_cls, "setAction", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+
+    // --- SwipeRefreshLayout ---
+    DxClass *swipe_refresh_cls = reg_class(vm, "Landroidx/swiperefreshlayout/widget/SwipeRefreshLayout;", viewgroup_cls);
+    add_method(swipe_refresh_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(swipe_refresh_cls, "setOnRefreshListener", "VL", DX_ACC_PUBLIC,
+               native_swipe_refresh_set_on_refresh_listener, false);
+    add_method(swipe_refresh_cls, "setRefreshing", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(swipe_refresh_cls, "isRefreshing", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(swipe_refresh_cls, "setColorSchemeResources", "VI", DX_ACC_PUBLIC, native_noop, false);
+    add_method(swipe_refresh_cls, "setColorSchemeColors", "VI", DX_ACC_PUBLIC, native_noop, false);
+
+    // SwipeRefreshLayout$OnRefreshListener (interface)
+    DxClass *on_refresh_cls = reg_class(vm, "Landroidx/swiperefreshlayout/widget/SwipeRefreshLayout$OnRefreshListener;", obj);
+    on_refresh_cls->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+
+    // Also register the legacy support library path
+    DxClass *swipe_refresh_support_cls = reg_class(vm, "Landroid/support/v4/widget/SwipeRefreshLayout;", viewgroup_cls);
+    add_method(swipe_refresh_support_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(swipe_refresh_support_cls, "setOnRefreshListener", "VL", DX_ACC_PUBLIC,
+               native_swipe_refresh_set_on_refresh_listener, false);
+    add_method(swipe_refresh_support_cls, "setRefreshing", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(swipe_refresh_support_cls, "isRefreshing", "Z", DX_ACC_PUBLIC, native_return_false, false);
 
     // --- android.app.* (services, dialogs, notifications) ---
     DxClass *application_cls = reg_class(vm, "Landroid/app/Application;", context_cls);
@@ -11320,8 +11803,8 @@ DxResult dx_register_android_framework(DxVM *vm) {
 
     // android.media.AudioManager
     DxClass *audio_mgr_cls = reg_class(vm, "Landroid/media/AudioManager;", obj);
-    add_method(audio_mgr_cls, "getStreamMaxVolume", "II", DX_ACC_PUBLIC, native_return_int_zero, false);
-    add_method(audio_mgr_cls, "getStreamVolume", "II", DX_ACC_PUBLIC, native_return_int_zero, false);
+    add_method(audio_mgr_cls, "getStreamMaxVolume", "II", DX_ACC_PUBLIC, native_return_int_15, false);
+    add_method(audio_mgr_cls, "getStreamVolume", "II", DX_ACC_PUBLIC, native_return_int_10, false);
     add_method(audio_mgr_cls, "setStreamVolume", "VIII", DX_ACC_PUBLIC, native_noop, false);
     add_method(audio_mgr_cls, "getRingerMode", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
 
@@ -11702,22 +12185,67 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(compat_cls, "getDrawable", "LLI", DX_ACC_PUBLIC | DX_ACC_STATIC,
                native_return_null, true);
     add_method(compat_cls, "checkSelfPermission", "ILL", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_int_zero, true);
+               native_compat_check_permission, true);
     add_method(compat_cls, "startForegroundService", "VLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
                native_noop, true);
 
     // androidx.core.app.ActivityCompat
     DxClass *activity_compat_cls = reg_class(vm, "Landroidx/core/app/ActivityCompat;", obj);
     add_method(activity_compat_cls, "requestPermissions", "VLLI", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_noop, true);
+               native_compat_request_permissions, true);
     add_method(activity_compat_cls, "shouldShowRequestPermissionRationale", "ZLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
                native_return_false, true);
     add_method(activity_compat_cls, "checkSelfPermission", "ILL", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_int_zero, true);
+               native_compat_check_permission, true);
 
-    // android.Manifest$permission (just register the class so lookups don't fail)
+    // android.Manifest$permission — string constants for common permissions
     DxClass *manifest_perm_cls = reg_class(vm, "Landroid/Manifest$permission;", obj);
-    (void)manifest_perm_cls;
+    {
+        DxObject *s_internet = dx_vm_create_string(vm, "android.permission.INTERNET");
+        DxObject *s_net_state = dx_vm_create_string(vm, "android.permission.ACCESS_NETWORK_STATE");
+        DxObject *s_wifi = dx_vm_create_string(vm, "android.permission.ACCESS_WIFI_STATE");
+        DxObject *s_vibrate = dx_vm_create_string(vm, "android.permission.VIBRATE");
+        DxObject *s_wake = dx_vm_create_string(vm, "android.permission.WAKE_LOCK");
+        DxObject *s_camera = dx_vm_create_string(vm, "android.permission.CAMERA");
+        DxObject *s_fine_loc = dx_vm_create_string(vm, "android.permission.ACCESS_FINE_LOCATION");
+        DxObject *s_coarse_loc = dx_vm_create_string(vm, "android.permission.ACCESS_COARSE_LOCATION");
+        DxObject *s_read_cont = dx_vm_create_string(vm, "android.permission.READ_CONTACTS");
+        DxObject *s_write_cont = dx_vm_create_string(vm, "android.permission.WRITE_CONTACTS");
+        DxObject *s_read_ext = dx_vm_create_string(vm, "android.permission.READ_EXTERNAL_STORAGE");
+        DxObject *s_write_ext = dx_vm_create_string(vm, "android.permission.WRITE_EXTERNAL_STORAGE");
+        DxObject *s_record = dx_vm_create_string(vm, "android.permission.RECORD_AUDIO");
+        DxObject *s_phone = dx_vm_create_string(vm, "android.permission.CALL_PHONE");
+        DxObject *s_sms = dx_vm_create_string(vm, "android.permission.SEND_SMS");
+        DxObject *s_fg_svc = dx_vm_create_string(vm, "android.permission.FOREGROUND_SERVICE");
+        const char *mp_names[] = {
+            "INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE",
+            "VIBRATE", "WAKE_LOCK", "CAMERA",
+            "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION",
+            "READ_CONTACTS", "WRITE_CONTACTS",
+            "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE",
+            "RECORD_AUDIO", "CALL_PHONE", "SEND_SMS",
+            "FOREGROUND_SERVICE"
+        };
+        DxValue mp_vals[] = {
+            s_internet ? DX_OBJ_VALUE(s_internet) : DX_NULL_VALUE,
+            s_net_state ? DX_OBJ_VALUE(s_net_state) : DX_NULL_VALUE,
+            s_wifi ? DX_OBJ_VALUE(s_wifi) : DX_NULL_VALUE,
+            s_vibrate ? DX_OBJ_VALUE(s_vibrate) : DX_NULL_VALUE,
+            s_wake ? DX_OBJ_VALUE(s_wake) : DX_NULL_VALUE,
+            s_camera ? DX_OBJ_VALUE(s_camera) : DX_NULL_VALUE,
+            s_fine_loc ? DX_OBJ_VALUE(s_fine_loc) : DX_NULL_VALUE,
+            s_coarse_loc ? DX_OBJ_VALUE(s_coarse_loc) : DX_NULL_VALUE,
+            s_read_cont ? DX_OBJ_VALUE(s_read_cont) : DX_NULL_VALUE,
+            s_write_cont ? DX_OBJ_VALUE(s_write_cont) : DX_NULL_VALUE,
+            s_read_ext ? DX_OBJ_VALUE(s_read_ext) : DX_NULL_VALUE,
+            s_write_ext ? DX_OBJ_VALUE(s_write_ext) : DX_NULL_VALUE,
+            s_record ? DX_OBJ_VALUE(s_record) : DX_NULL_VALUE,
+            s_phone ? DX_OBJ_VALUE(s_phone) : DX_NULL_VALUE,
+            s_sms ? DX_OBJ_VALUE(s_sms) : DX_NULL_VALUE,
+            s_fg_svc ? DX_OBJ_VALUE(s_fg_svc) : DX_NULL_VALUE
+        };
+        add_static_fields(manifest_perm_cls, mp_names, mp_vals, 16);
+    }
 
     DxClass *view_compat_cls = reg_class(vm, "Landroidx/core/view/ViewCompat;", obj);
     add_method(view_compat_cls, "setElevation", "VLF", DX_ACC_PUBLIC | DX_ACC_STATIC,
@@ -13973,8 +14501,299 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(dateformat_cls, "is24HourFormat", "ZL", DX_ACC_PUBLIC | DX_ACC_STATIC,
                native_return_true, true);
 
+    // ============================================================
+    // android.media.MediaPlayer
+    // ============================================================
+    DxClass *mediaplayer_cls = reg_class(vm, "Landroid/media/MediaPlayer;", obj);
+    add_method(mediaplayer_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    add_method(mediaplayer_cls, "create", "LLI", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_mediaplayer_create, true);
+    add_method(mediaplayer_cls, "create", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_mediaplayer_create, true);
+    add_method(mediaplayer_cls, "setDataSource", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "setDataSource", "VLL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "prepare", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "prepareAsync", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "start", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "pause", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "stop", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "release", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "reset", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "isPlaying", "Z", DX_ACC_PUBLIC,
+               native_return_false, false);
+    add_method(mediaplayer_cls, "getDuration", "I", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(mediaplayer_cls, "getCurrentPosition", "I", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(mediaplayer_cls, "seekTo", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "setLooping", "VZ", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "isLooping", "Z", DX_ACC_PUBLIC,
+               native_return_false, false);
+    add_method(mediaplayer_cls, "setVolume", "VFF", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "setOnPreparedListener", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "setOnCompletionListener", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "setOnErrorListener", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "setAudioAttributes", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "setAudioStreamType", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(mediaplayer_cls, "setWakeMode", "VLI", DX_ACC_PUBLIC,
+               native_noop, false);
+
+    // MediaPlayer listener interfaces
+    DxClass *mp_on_prepared = reg_class(vm, "Landroid/media/MediaPlayer$OnPreparedListener;", obj);
+    mp_on_prepared->access_flags = DX_ACC_PUBLIC | DX_ACC_INTERFACE;
+    add_method(mp_on_prepared, "onPrepared", "VL", DX_ACC_PUBLIC | DX_ACC_ABSTRACT,
+               native_noop, false);
+
+    DxClass *mp_on_completion = reg_class(vm, "Landroid/media/MediaPlayer$OnCompletionListener;", obj);
+    mp_on_completion->access_flags = DX_ACC_PUBLIC | DX_ACC_INTERFACE;
+    add_method(mp_on_completion, "onCompletion", "VL", DX_ACC_PUBLIC | DX_ACC_ABSTRACT,
+               native_noop, false);
+
+    DxClass *mp_on_error = reg_class(vm, "Landroid/media/MediaPlayer$OnErrorListener;", obj);
+    mp_on_error->access_flags = DX_ACC_PUBLIC | DX_ACC_INTERFACE;
+    add_method(mp_on_error, "onError", "ZLII", DX_ACC_PUBLIC | DX_ACC_ABSTRACT,
+               native_return_false, false);
+
+    // ============================================================
+    // android.media.AudioAttributes + Builder
+    // ============================================================
+    DxClass *audio_attr_cls = reg_class(vm, "Landroid/media/AudioAttributes;", obj);
+    add_method(audio_attr_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    {
+        const char *aa_names[] = {
+            "USAGE_MEDIA", "USAGE_GAME", "USAGE_ALARM", "USAGE_NOTIFICATION",
+            "USAGE_ASSISTANCE_SONIFICATION", "USAGE_VOICE_COMMUNICATION",
+            "CONTENT_TYPE_MUSIC", "CONTENT_TYPE_MOVIE", "CONTENT_TYPE_SONIFICATION",
+            "CONTENT_TYPE_SPEECH", "CONTENT_TYPE_UNKNOWN"
+        };
+        DxValue aa_vals[] = {
+            DX_INT_VALUE(1), DX_INT_VALUE(14), DX_INT_VALUE(4), DX_INT_VALUE(5),
+            DX_INT_VALUE(13), DX_INT_VALUE(2),
+            DX_INT_VALUE(2), DX_INT_VALUE(3), DX_INT_VALUE(4),
+            DX_INT_VALUE(1), DX_INT_VALUE(0)
+        };
+        add_static_fields(audio_attr_cls, aa_names, aa_vals, 11);
+    }
+
+    DxClass *audio_attr_builder_cls = reg_class(vm, "Landroid/media/AudioAttributes$Builder;", obj);
+    add_method(audio_attr_builder_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    add_method(audio_attr_builder_cls, "setUsage", "LI", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_attr_builder_cls, "setContentType", "LI", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_attr_builder_cls, "setFlags", "LI", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_attr_builder_cls, "setLegacyStreamType", "LI", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_attr_builder_cls, "build", "L", DX_ACC_PUBLIC,
+               native_audio_attr_builder_build, false);
+
+    // ============================================================
+    // android.media.SoundPool + Builder
+    // ============================================================
+    DxClass *soundpool_cls = reg_class(vm, "Landroid/media/SoundPool;", obj);
+    add_method(soundpool_cls, "<init>", "VIII", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    add_method(soundpool_cls, "load", "ILII", DX_ACC_PUBLIC,
+               native_soundpool_load, false);
+    add_method(soundpool_cls, "load", "ILI", DX_ACC_PUBLIC,
+               native_soundpool_load, false);
+    add_method(soundpool_cls, "play", "IIFFIFI", DX_ACC_PUBLIC,
+               native_soundpool_play, false);
+    add_method(soundpool_cls, "stop", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "pause", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "resume", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "release", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "setVolume", "VIF", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "setRate", "VIF", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "setLoop", "VII", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "setPriority", "VII", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "autoPause", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "autoResume", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(soundpool_cls, "unload", "ZI", DX_ACC_PUBLIC,
+               native_return_true, false);
+    add_method(soundpool_cls, "setOnLoadCompleteListener", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+
+    DxClass *soundpool_builder_cls = reg_class(vm, "Landroid/media/SoundPool$Builder;", obj);
+    add_method(soundpool_builder_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    add_method(soundpool_builder_cls, "setMaxStreams", "LI", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(soundpool_builder_cls, "setAudioAttributes", "LL", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(soundpool_builder_cls, "build", "L", DX_ACC_PUBLIC,
+               native_soundpool_builder_build, false);
+
+    // SoundPool.OnLoadCompleteListener interface
+    DxClass *sp_on_load = reg_class(vm, "Landroid/media/SoundPool$OnLoadCompleteListener;", obj);
+    sp_on_load->access_flags = DX_ACC_PUBLIC | DX_ACC_INTERFACE;
+    add_method(sp_on_load, "onLoadComplete", "VLII", DX_ACC_PUBLIC | DX_ACC_ABSTRACT,
+               native_noop, false);
+
+    // ============================================================
+    // android.media.AudioManager (expand existing stub)
+    // ============================================================
+    // audio_mgr_cls already registered above; add missing methods
+    add_method(audio_mgr_cls, "requestAudioFocus", "ILII", DX_ACC_PUBLIC,
+               native_audio_focus_granted, false);
+    add_method(audio_mgr_cls, "requestAudioFocus", "ILL", DX_ACC_PUBLIC,
+               native_audio_focus_granted, false);
+    add_method(audio_mgr_cls, "abandonAudioFocus", "IL", DX_ACC_PUBLIC,
+               native_return_int_one, false);
+    add_method(audio_mgr_cls, "abandonAudioFocusRequest", "IL", DX_ACC_PUBLIC,
+               native_return_int_one, false);
+    add_method(audio_mgr_cls, "isMusicActive", "Z", DX_ACC_PUBLIC,
+               native_return_false, false);
+    add_method(audio_mgr_cls, "getMode", "I", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(audio_mgr_cls, "setMode", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(audio_mgr_cls, "setSpeakerphoneOn", "VZ", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(audio_mgr_cls, "isSpeakerphoneOn", "Z", DX_ACC_PUBLIC,
+               native_return_false, false);
+    {
+        const char *am_names[] = {
+            "STREAM_VOICE_CALL", "STREAM_SYSTEM", "STREAM_RING",
+            "STREAM_MUSIC", "STREAM_ALARM", "STREAM_NOTIFICATION",
+            "STREAM_DTMF",
+            "AUDIOFOCUS_REQUEST_GRANTED", "AUDIOFOCUS_REQUEST_FAILED",
+            "AUDIOFOCUS_GAIN", "AUDIOFOCUS_LOSS",
+            "AUDIOFOCUS_LOSS_TRANSIENT", "AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK",
+            "MODE_NORMAL", "MODE_RINGTONE", "MODE_IN_CALL"
+        };
+        DxValue am_vals[] = {
+            DX_INT_VALUE(0), DX_INT_VALUE(1), DX_INT_VALUE(2),
+            DX_INT_VALUE(3), DX_INT_VALUE(4), DX_INT_VALUE(5),
+            DX_INT_VALUE(8),
+            DX_INT_VALUE(1), DX_INT_VALUE(0),
+            DX_INT_VALUE(1), DX_INT_VALUE(-1),
+            DX_INT_VALUE(-2), DX_INT_VALUE(-3),
+            DX_INT_VALUE(0), DX_INT_VALUE(1), DX_INT_VALUE(2)
+        };
+        add_static_fields(audio_mgr_cls, am_names, am_vals, 16);
+    }
+
+    // AudioManager.OnAudioFocusChangeListener interface
+    DxClass *audio_focus_listener = reg_class(vm, "Landroid/media/AudioManager$OnAudioFocusChangeListener;", obj);
+    audio_focus_listener->access_flags = DX_ACC_PUBLIC | DX_ACC_INTERFACE;
+    add_method(audio_focus_listener, "onAudioFocusChange", "VI", DX_ACC_PUBLIC | DX_ACC_ABSTRACT,
+               native_noop, false);
+
+    // AudioFocusRequest + Builder
+    DxClass *audio_focus_req = reg_class(vm, "Landroid/media/AudioFocusRequest;", obj);
+    add_method(audio_focus_req, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+
+    DxClass *audio_focus_req_builder = reg_class(vm, "Landroid/media/AudioFocusRequest$Builder;", obj);
+    add_method(audio_focus_req_builder, "<init>", "VI", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    add_method(audio_focus_req_builder, "setAudioAttributes", "LL", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_focus_req_builder, "setOnAudioFocusChangeListener", "LL", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_focus_req_builder, "setAcceptsDelayedFocusGain", "LZ", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_focus_req_builder, "setWillPauseWhenDucked", "LZ", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_focus_req_builder, "build", "L", DX_ACC_PUBLIC,
+               native_return_new_object, false);
+
+    // ============================================================
+    // android.media.Ringtone + RingtoneManager (expand existing)
+    // ============================================================
+    DxClass *ringtone_cls = reg_class(vm, "Landroid/media/Ringtone;", obj);
+    add_method(ringtone_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    add_method(ringtone_cls, "play", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(ringtone_cls, "stop", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(ringtone_cls, "isPlaying", "Z", DX_ACC_PUBLIC,
+               native_return_false, false);
+    add_method(ringtone_cls, "setLooping", "VZ", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(ringtone_cls, "setVolume", "VF", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(ringtone_cls, "getTitle", "LL", DX_ACC_PUBLIC,
+               native_return_null, false);
+
+    // Expand RingtoneManager (rm_cls already registered above with getDefaultUri)
+    add_method(rm_cls, "getRingtone", "LLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_ringtone_manager_get_ringtone, true);
+    add_method(rm_cls, "getActualDefaultRingtoneUri", "LLI", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_null, true);
+    {
+        const char *rm_names[] = { "TYPE_RINGTONE", "TYPE_NOTIFICATION", "TYPE_ALARM", "TYPE_ALL" };
+        DxValue rm_vals[] = {
+            DX_INT_VALUE(1), DX_INT_VALUE(2), DX_INT_VALUE(4), DX_INT_VALUE(7)
+        };
+        add_static_fields(rm_cls, rm_names, rm_vals, 4);
+    }
+
+    // ============================================================
+    // android.media.AudioFormat + Builder
+    // ============================================================
+    DxClass *audio_format_cls = reg_class(vm, "Landroid/media/AudioFormat;", obj);
+    {
+        const char *af_names[] = {
+            "ENCODING_PCM_16BIT", "ENCODING_PCM_8BIT", "ENCODING_PCM_FLOAT",
+            "CHANNEL_OUT_MONO", "CHANNEL_OUT_STEREO",
+            "CHANNEL_IN_MONO", "CHANNEL_IN_STEREO"
+        };
+        DxValue af_vals[] = {
+            DX_INT_VALUE(2), DX_INT_VALUE(3), DX_INT_VALUE(4),
+            DX_INT_VALUE(4), DX_INT_VALUE(12),
+            DX_INT_VALUE(16), DX_INT_VALUE(12)
+        };
+        add_static_fields(audio_format_cls, af_names, af_vals, 7);
+    }
+
+    DxClass *audio_format_builder = reg_class(vm, "Landroid/media/AudioFormat$Builder;", obj);
+    add_method(audio_format_builder, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true);
+    add_method(audio_format_builder, "setEncoding", "LI", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_format_builder, "setSampleRate", "LI", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_format_builder, "setChannelMask", "LI", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(audio_format_builder, "build", "L", DX_ACC_PUBLIC,
+               native_return_new_object, false);
+
     // --- Increase DX_MAX_CLASSES if needed ---
-    // We're now registering 360+ classes, the limit of 2048 should be fine
+    // We're now registering 380+ classes, the limit of 2048 should be fine
 
     DX_INFO(TAG, "Registered Android framework classes (%u total, production-grade)", vm->class_count);
     return DX_OK;
@@ -14262,6 +15081,286 @@ static DxResult native_field_set(DxVM *vm, DxFrame *frame, DxValue *args, uint32
     if (target && field_name) {
         dx_vm_set_field(target, field_name, new_val);
     }
+    return DX_OK;
+}
+
+// ============================================================
+// Framework reflection: Class annotation/method/field support
+// (uses field[0] = DxClass* as int pattern from forName)
+// ============================================================
+
+// Helper: extract DxClass* from a Class object (fw variant: field[0] as int)
+static DxClass *extract_dxclass_fw(DxObject *class_obj) {
+    if (!class_obj) return NULL;
+    // Try field[0] as int (framework pattern from Class.forName in this file)
+    if (class_obj->fields && class_obj->klass && class_obj->klass->instance_field_count > 0
+        && class_obj->fields[0].tag == DX_VAL_INT && class_obj->fields[0].i != 0) {
+        return (DxClass *)(uintptr_t)class_obj->fields[0].i;
+    }
+    // Fall back to klass pointer (dx_vm.c pattern from Object.getClass)
+    if (class_obj->klass) return class_obj->klass;
+    return NULL;
+}
+
+// Class.getAnnotation(Class annotationType) -> Annotation or null
+static DxResult native_class_get_annotation_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *self = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxClass *cls = extract_dxclass_fw(self);
+    DxClass *anno_type = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? extract_dxclass_fw(args[1].obj) : NULL;
+
+    if (cls && anno_type && cls->annotations && anno_type->descriptor) {
+        for (uint32_t i = 0; i < cls->annotation_count; i++) {
+            if (cls->annotations[i].type && strcmp(cls->annotations[i].type, anno_type->descriptor) == 0) {
+                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_type);
+                frame->result = anno_obj ? DX_OBJ_VALUE(anno_obj) : DX_NULL_VALUE;
+                frame->has_result = true;
+                return DX_OK;
+            }
+        }
+    }
+    frame->result = DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Class.isAnnotationPresent(Class annotationType) -> boolean
+static DxResult native_class_is_annotation_present_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxClass *cls = extract_dxclass_fw(self);
+    DxClass *anno_type = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? extract_dxclass_fw(args[1].obj) : NULL;
+
+    bool found = false;
+    if (cls && anno_type && cls->annotations && anno_type->descriptor) {
+        for (uint32_t i = 0; i < cls->annotation_count; i++) {
+            if (cls->annotations[i].type && strcmp(cls->annotations[i].type, anno_type->descriptor) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    frame->result = DX_INT_VALUE(found ? 1 : 0);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Class.getAnnotations() -> Annotation[]
+static DxResult native_class_get_annotations_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *self = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxClass *cls = extract_dxclass_fw(self);
+
+    uint32_t count = (cls && cls->annotations) ? cls->annotation_count : 0;
+    DxObject *arr = dx_vm_alloc_array(vm, count);
+    if (arr && cls && cls->annotations) {
+        for (uint32_t i = 0; i < count; i++) {
+            DxClass *anno_cls = dx_vm_find_class(vm, cls->annotations[i].type);
+            if (anno_cls) {
+                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_cls);
+                if (anno_obj) arr->array_elements[i] = DX_OBJ_VALUE(anno_obj);
+            }
+        }
+    }
+    frame->result = arr ? DX_OBJ_VALUE(arr) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Class.getDeclaredMethods() -> Method[]
+static DxResult native_class_get_declared_methods_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *self = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxClass *cls = extract_dxclass_fw(self);
+    DxClass *method_cls = dx_vm_find_class(vm, "Ljava/lang/reflect/Method;");
+
+    if (!cls || !method_cls) {
+        DxObject *empty = dx_vm_alloc_array(vm, 0);
+        frame->result = empty ? DX_OBJ_VALUE(empty) : DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    uint32_t total = cls->direct_method_count + cls->virtual_method_count;
+    DxObject *arr = dx_vm_alloc_array(vm, total);
+    if (!arr) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+
+    uint32_t idx = 0;
+    for (uint32_t i = 0; i < cls->direct_method_count && idx < total; i++) {
+        DxMethod *m = &cls->direct_methods[i];
+        DxObject *mobj = dx_vm_alloc_object(vm, method_cls);
+        if (mobj && mobj->fields && method_cls->instance_field_count > 0) {
+            mobj->fields[0].tag = DX_VAL_INT;
+            mobj->fields[0].i = (int32_t)(uintptr_t)m;
+        }
+        arr->array_elements[idx++] = mobj ? DX_OBJ_VALUE(mobj) : DX_NULL_VALUE;
+    }
+    for (uint32_t i = 0; i < cls->virtual_method_count && idx < total; i++) {
+        DxMethod *m = &cls->virtual_methods[i];
+        DxObject *mobj = dx_vm_alloc_object(vm, method_cls);
+        if (mobj && mobj->fields && method_cls->instance_field_count > 0) {
+            mobj->fields[0].tag = DX_VAL_INT;
+            mobj->fields[0].i = (int32_t)(uintptr_t)m;
+        }
+        arr->array_elements[idx++] = mobj ? DX_OBJ_VALUE(mobj) : DX_NULL_VALUE;
+    }
+
+    frame->result = DX_OBJ_VALUE(arr);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Class.getDeclaredFields() -> Field[]
+static DxResult native_class_get_declared_fields_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *self = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxClass *cls = extract_dxclass_fw(self);
+    DxClass *field_cls_type = dx_vm_find_class(vm, "Ljava/lang/reflect/Field;");
+
+    if (!cls || !field_cls_type) {
+        DxObject *empty = dx_vm_alloc_array(vm, 0);
+        frame->result = empty ? DX_OBJ_VALUE(empty) : DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    uint32_t total = cls->instance_field_count + cls->static_field_count;
+    DxObject *arr = dx_vm_alloc_array(vm, total);
+    if (!arr) { frame->result = DX_NULL_VALUE; frame->has_result = true; return DX_OK; }
+
+    uint32_t idx = 0;
+    uint32_t field_def_count = 0;
+    if (cls->field_defs) {
+        field_def_count = cls->instance_field_count + cls->static_field_count;
+    }
+    for (uint32_t i = 0; i < field_def_count && idx < total; i++) {
+        DxObject *fobj = dx_vm_alloc_object(vm, field_cls_type);
+        if (fobj && fobj->fields && field_cls_type->instance_field_count > 0 && cls->field_defs[i].name) {
+            DxObject *name_str = dx_vm_create_string(vm, cls->field_defs[i].name);
+            fobj->fields[0] = name_str ? DX_OBJ_VALUE(name_str) : DX_NULL_VALUE;
+        }
+        arr->array_elements[idx++] = fobj ? DX_OBJ_VALUE(fobj) : DX_NULL_VALUE;
+    }
+
+    frame->result = DX_OBJ_VALUE(arr);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// Framework reflection: Method annotation support
+// ============================================================
+
+// Method.getAnnotation(Class annotationType) -> Annotation or null
+static DxResult native_method_get_annotation_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    DxObject *method_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxMethod *method = NULL;
+    if (method_obj && method_obj->fields && method_obj->klass
+        && method_obj->klass->instance_field_count > 0
+        && method_obj->fields[0].tag == DX_VAL_INT) {
+        method = (DxMethod *)(uintptr_t)method_obj->fields[0].i;
+    }
+
+    DxClass *anno_type = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? extract_dxclass_fw(args[1].obj) : NULL;
+
+    if (method && anno_type && method->annotations && anno_type->descriptor) {
+        for (uint32_t i = 0; i < method->annotation_count; i++) {
+            if (method->annotations[i].type && strcmp(method->annotations[i].type, anno_type->descriptor) == 0) {
+                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_type);
+                frame->result = anno_obj ? DX_OBJ_VALUE(anno_obj) : DX_NULL_VALUE;
+                frame->has_result = true;
+                return DX_OK;
+            }
+        }
+    }
+    frame->result = DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Method.isAnnotationPresent(Class annotationType) -> boolean
+static DxResult native_method_is_annotation_present_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *method_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxMethod *method = NULL;
+    if (method_obj && method_obj->fields && method_obj->klass
+        && method_obj->klass->instance_field_count > 0
+        && method_obj->fields[0].tag == DX_VAL_INT) {
+        method = (DxMethod *)(uintptr_t)method_obj->fields[0].i;
+    }
+
+    DxClass *anno_type = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? extract_dxclass_fw(args[1].obj) : NULL;
+
+    bool found = false;
+    if (method && anno_type && method->annotations && anno_type->descriptor) {
+        for (uint32_t i = 0; i < method->annotation_count; i++) {
+            if (method->annotations[i].type && strcmp(method->annotations[i].type, anno_type->descriptor) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    frame->result = DX_INT_VALUE(found ? 1 : 0);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Method.getAnnotations() -> Annotation[]
+static DxResult native_method_get_annotations_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *method_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxMethod *method = NULL;
+    if (method_obj && method_obj->fields && method_obj->klass
+        && method_obj->klass->instance_field_count > 0
+        && method_obj->fields[0].tag == DX_VAL_INT) {
+        method = (DxMethod *)(uintptr_t)method_obj->fields[0].i;
+    }
+
+    uint32_t count = (method && method->annotations) ? method->annotation_count : 0;
+    DxObject *arr = dx_vm_alloc_array(vm, count);
+    if (arr && method && method->annotations) {
+        for (uint32_t i = 0; i < count; i++) {
+            DxClass *anno_cls = dx_vm_find_class(vm, method->annotations[i].type);
+            if (anno_cls) {
+                DxObject *anno_obj = dx_vm_alloc_object(vm, anno_cls);
+                if (anno_obj) arr->array_elements[i] = DX_OBJ_VALUE(anno_obj);
+            }
+        }
+    }
+    frame->result = arr ? DX_OBJ_VALUE(arr) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Method.getName() -> String
+static DxResult native_method_get_name_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *method_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxMethod *method = NULL;
+    if (method_obj && method_obj->fields && method_obj->klass
+        && method_obj->klass->instance_field_count > 0
+        && method_obj->fields[0].tag == DX_VAL_INT) {
+        method = (DxMethod *)(uintptr_t)method_obj->fields[0].i;
+    }
+    const char *name = (method && method->name) ? method->name : "unknown";
+    DxObject *str = dx_vm_create_string(vm, name);
+    frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Field.getName() -> String
+static DxResult native_field_get_name_fw(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *field_obj = (args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    const char *name = NULL;
+    if (field_obj && field_obj->fields && field_obj->klass
+        && field_obj->klass->instance_field_count > 0
+        && field_obj->fields[0].tag == DX_VAL_OBJ && field_obj->fields[0].obj) {
+        name = dx_vm_get_string_value(field_obj->fields[0].obj);
+    }
+    DxObject *str = dx_vm_create_string(vm, name ? name : "unknown");
+    frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+    frame->has_result = true;
     return DX_OK;
 }
 

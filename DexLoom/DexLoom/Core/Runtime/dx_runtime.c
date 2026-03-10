@@ -94,6 +94,17 @@ DxResult dx_runtime_load(DxContext *ctx, const char *apk_path) {
                     }
                 }
 
+                // Extract theme resource ID from manifest
+                if (manifest->app_theme) {
+                    // If it starts with "@0x", parse the hex resource ID
+                    if (manifest->app_theme[0] == '@' && manifest->app_theme[1] == '0' &&
+                        manifest->app_theme[2] == 'x') {
+                        ctx->theme_res_id = (uint32_t)strtoul(manifest->app_theme + 1, NULL, 16);
+                    }
+                    DX_INFO(TAG, "App theme: %s (res_id=0x%08x)",
+                            manifest->app_theme, ctx->theme_res_id);
+                }
+
                 DX_INFO(TAG, "Package: %s", ctx->package_name ? ctx->package_name : "(null)");
                 DX_INFO(TAG, "Main activity: %s", ctx->main_activity_class ? ctx->main_activity_class : "(null)");
                 dx_manifest_free(manifest);
@@ -122,6 +133,15 @@ DxResult dx_runtime_load(DxContext *ctx, const char *apk_path) {
                 }
             }
             dx_free(res_data);
+        }
+    }
+
+    // Create the application theme from the manifest's android:theme
+    if (ctx->theme_res_id != 0 && ctx->resources) {
+        ctx->theme = dx_theme_create(ctx->resources, ctx->theme_res_id);
+        if (ctx->theme) {
+            DX_INFO(TAG, "Application theme resolved: 0x%08x (%u attrs)",
+                    ctx->theme_res_id, ctx->theme->bag->entry_count);
         }
     }
 

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 #define TAG "UITree"
 
@@ -109,6 +110,8 @@ void dx_ui_node_destroy(DxUINode *node) {
     dx_free(node->text);
     dx_free(node->hint);
     dx_free(node->image_data);
+    dx_free(node->web_url);
+    dx_free(node->web_html);
     dx_free(node);
 }
 
@@ -173,6 +176,137 @@ uint32_t dx_ui_node_score_layout(const DxUINode *root) {
 }
 
 // ============================================================
+// UI tree inspector
+// ============================================================
+
+static const char *view_type_name(DxViewType type) {
+    switch (type) {
+        case DX_VIEW_NONE:              return "None";
+        case DX_VIEW_LINEAR_LAYOUT:     return "LinearLayout";
+        case DX_VIEW_TEXT_VIEW:          return "TextView";
+        case DX_VIEW_BUTTON:            return "Button";
+        case DX_VIEW_IMAGE_VIEW:        return "ImageView";
+        case DX_VIEW_EDIT_TEXT:          return "EditText";
+        case DX_VIEW_FRAME_LAYOUT:      return "FrameLayout";
+        case DX_VIEW_RELATIVE_LAYOUT:   return "RelativeLayout";
+        case DX_VIEW_CONSTRAINT_LAYOUT: return "ConstraintLayout";
+        case DX_VIEW_SCROLL_VIEW:       return "ScrollView";
+        case DX_VIEW_RECYCLER_VIEW:     return "RecyclerView";
+        case DX_VIEW_CARD_VIEW:         return "CardView";
+        case DX_VIEW_SWITCH:            return "Switch";
+        case DX_VIEW_CHECKBOX:          return "CheckBox";
+        case DX_VIEW_PROGRESS_BAR:      return "ProgressBar";
+        case DX_VIEW_TOOLBAR:           return "Toolbar";
+        case DX_VIEW_VIEW:              return "View";
+        case DX_VIEW_VIEW_GROUP:        return "ViewGroup";
+        case DX_VIEW_LIST_VIEW:         return "ListView";
+        case DX_VIEW_GRID_VIEW:         return "GridView";
+        case DX_VIEW_SPINNER:           return "Spinner";
+        case DX_VIEW_SEEK_BAR:          return "SeekBar";
+        case DX_VIEW_RATING_BAR:        return "RatingBar";
+        case DX_VIEW_RADIO_BUTTON:      return "RadioButton";
+        case DX_VIEW_RADIO_GROUP:       return "RadioGroup";
+        case DX_VIEW_FAB:               return "FAB";
+        case DX_VIEW_TAB_LAYOUT:        return "TabLayout";
+        case DX_VIEW_VIEW_PAGER:        return "ViewPager";
+        case DX_VIEW_WEB_VIEW:          return "WebView";
+        case DX_VIEW_CHIP:              return "Chip";
+        case DX_VIEW_BOTTOM_NAV:        return "BottomNav";
+        case DX_VIEW_SWIPE_REFRESH:     return "SwipeRefresh";
+        default:                        return "Unknown";
+    }
+}
+
+// Dynamic string buffer for tree dump
+typedef struct {
+    char    *data;
+    uint32_t len;
+    uint32_t cap;
+} DxStrBuf;
+
+static void strbuf_init(DxStrBuf *sb) {
+    sb->cap = 1024;
+    sb->data = (char *)dx_malloc(sb->cap);
+    sb->len = 0;
+    if (sb->data) sb->data[0] = '\0';
+}
+
+static void strbuf_appendf(DxStrBuf *sb, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void strbuf_appendf(DxStrBuf *sb, const char *fmt, ...) {
+    if (!sb->data) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed < 0) return;
+
+    while (sb->len + (uint32_t)needed + 1 > sb->cap) {
+        uint32_t new_cap = sb->cap * 2;
+        char *new_data = (char *)dx_realloc(sb->data, new_cap);
+        if (!new_data) return;
+        sb->data = new_data;
+        sb->cap = new_cap;
+    }
+
+    va_start(ap, fmt);
+    vsnprintf(sb->data + sb->len, sb->cap - sb->len, fmt, ap);
+    va_end(ap);
+    sb->len += (uint32_t)needed;
+}
+
+static void dump_node(DxStrBuf *sb, DxUINode *node, int depth) {
+    if (!node) return;
+
+    // Indentation
+    for (int i = 0; i < depth; i++) {
+        strbuf_appendf(sb, "  ");
+    }
+
+    // Node info
+    strbuf_appendf(sb, "%s", view_type_name(node->type));
+    if (node->view_id != 0) {
+        strbuf_appendf(sb, " id=0x%x", node->view_id);
+    }
+    if (node->text) {
+        if (strlen(node->text) > 30) {
+            strbuf_appendf(sb, " text=\"%.27s...\"", node->text);
+        } else {
+            strbuf_appendf(sb, " text=\"%s\"", node->text);
+        }
+    }
+    strbuf_appendf(sb, " w=%d h=%d", node->width, node->height);
+    if (node->child_count > 0) {
+        strbuf_appendf(sb, " children=%u", node->child_count);
+    }
+    if (node->visibility == DX_GONE) {
+        strbuf_appendf(sb, " [GONE]");
+    } else if (node->visibility == DX_INVISIBLE) {
+        strbuf_appendf(sb, " [INVISIBLE]");
+    }
+    strbuf_appendf(sb, "\n");
+
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        dump_node(sb, node->children[i], depth + 1);
+    }
+}
+
+char *dx_ui_tree_dump(DxUINode *root) {
+    if (!root) {
+        char *empty = dx_strdup("(no UI tree)\n");
+        return empty;
+    }
+
+    DxStrBuf sb;
+    strbuf_init(&sb);
+
+    uint32_t total = dx_ui_node_count(root);
+    strbuf_appendf(&sb, "UI Tree (%u nodes):\n", total);
+    dump_node(&sb, root, 0);
+
+    return sb.data;  // caller must free
+}
+
+// ============================================================
 // Render model (serialized snapshot for Swift bridge)
 // ============================================================
 
@@ -209,6 +343,8 @@ static DxRenderNode *serialize_node(DxUINode *node) {
     rn->constraints = node->constraints;
     rn->image_data = node->image_data;        // borrow pointer (DxUINode owns the data)
     rn->image_data_len = node->image_data_len;
+    rn->web_url = node->web_url ? dx_strdup(node->web_url) : NULL;
+    rn->web_html = node->web_html ? dx_strdup(node->web_html) : NULL;
 
     if (node->child_count > 0) {
         rn->children = (DxRenderNode *)dx_malloc(sizeof(DxRenderNode) * node->child_count);
@@ -243,6 +379,8 @@ static void free_render_node(DxRenderNode *node) {
     if (!node) return;
     dx_free(node->text);
     dx_free(node->hint);
+    dx_free(node->web_url);
+    dx_free(node->web_html);
     for (uint32_t i = 0; i < node->child_count; i++) {
         free_render_node(&node->children[i]);
     }
@@ -302,6 +440,20 @@ void dx_render_model_destroy(DxRenderModel *model) {
 #define ATTR_LAYOUT_MARGIN_START 0x010103b5
 #define ATTR_LAYOUT_MARGIN_END   0x010103b6
 #define ATTR_SRC           0x01010119  // android:src (ImageView drawable)
+
+// Style attribute
+#define ATTR_STYLE         0x010100ba  // android:style (but style is often attr index 0xFFFFFFFF)
+
+// Well-known theme attribute IDs (android.R.attr.*)
+#define ATTR_COLOR_PRIMARY       0x01010433
+#define ATTR_COLOR_PRIMARY_DARK  0x01010434
+#define ATTR_COLOR_ACCENT        0x01010435
+#define ATTR_COLOR_BACKGROUND    0x010100d4  // same as android:background
+#define ATTR_TEXT_COLOR_PRIMARY   0x01010036
+#define ATTR_WINDOW_BACKGROUND   0x01010054
+
+// Attribute reference type (for ?attr/ values)
+#define RES_VALUE_TYPE_ATTR  0x02
 
 // RelativeLayout attributes
 #define ATTR_LAYOUT_ABOVE            0x01010140
@@ -377,6 +529,155 @@ static uint8_t *dx_ui_extract_drawable(DxContext *ctx, uint32_t res_id, uint32_t
     DX_INFO(TAG, "Extracted drawable: %s (%u bytes) for res 0x%08x", path, size, res_id);
     *out_len = size;
     return data;
+}
+
+// ============================================================
+// Style / theme attribute application
+// ============================================================
+
+// Resolve a ?attr/ reference through the context's theme.
+// If value_type is 0x02 (attribute reference), look up in the theme.
+// Modifies value_type and value_data in-place to the resolved concrete value.
+static void resolve_attr_reference(DxContext *ctx, uint8_t *value_type, uint32_t *value_data) {
+    if (!ctx || !ctx->theme || *value_type != RES_VALUE_TYPE_ATTR) return;
+
+    const DxStyleEntry *resolved = dx_theme_resolve_attr(ctx->theme, *value_data);
+    if (resolved) {
+        // If the resolved value is itself a reference, try one more level
+        if (resolved->value_type == 0x01 && ctx->resources) {
+            const DxResourceEntry *re = dx_resources_find_by_id(ctx->resources, resolved->value_data);
+            if (re) {
+                *value_type = re->value_type;
+                *value_data = (re->value_type == 0x1C || re->value_type == 0x1D ||
+                               re->value_type == 0x1E || re->value_type == 0x1F)
+                              ? re->color_val
+                              : (uint32_t)re->int_val;
+                return;
+            }
+        }
+        *value_type = resolved->value_type;
+        *value_data = resolved->value_data;
+    }
+}
+
+// Apply a single style/theme attribute to a UI node.
+// Only applies if the node doesn't already have a non-default value for that attribute
+// (direct attributes take precedence over style attributes).
+static void apply_style_attr_to_node(DxUINode *node, DxContext *ctx,
+                                      uint32_t attr_id, uint8_t val_type, uint32_t val_data,
+                                      char **strings, uint32_t string_count) {
+    // Resolve ?attr/ references before applying
+    resolve_attr_reference(ctx, &val_type, &val_data);
+
+    switch (attr_id) {
+        case ATTR_TEXT_COLOR:
+            if (node->text_color == 0) { // not already set
+                if (val_type == 0x1C || val_type == 0x1D || val_type == 0x1E || val_type == 0x1F) {
+                    node->text_color = val_data;
+                }
+            }
+            break;
+
+        case ATTR_TEXT_SIZE:
+            if (node->text_size == 16.0f) { // still default
+                if (val_type == 0x05) {
+                    float val = dx_ui_decode_dimension(val_data);
+                    if (val > 0 && val < 200) node->text_size = val;
+                }
+            }
+            break;
+
+        case ATTR_BACKGROUND:
+            if (node->bg_color == 0) {
+                if (val_type == 0x1C || val_type == 0x1D || val_type == 0x1E || val_type == 0x1F) {
+                    node->bg_color = val_data;
+                }
+            }
+            break;
+
+        case ATTR_ORIENTATION:
+            // Only apply if still default vertical
+            if (node->orientation == DX_ORIENTATION_VERTICAL) {
+                node->orientation = (val_data == 1) ? DX_ORIENTATION_VERTICAL :
+                                                       DX_ORIENTATION_HORIZONTAL;
+            }
+            break;
+
+        case ATTR_GRAVITY:
+            if (node->gravity == 0) {
+                node->gravity = (int32_t)val_data;
+            }
+            break;
+
+        case ATTR_PADDING:
+            if (node->padding[0] == 0 && node->padding[1] == 0 &&
+                node->padding[2] == 0 && node->padding[3] == 0) {
+                int32_t pts = (val_type == 0x05) ? dx_ui_decode_dimension_int(val_data) : (int32_t)val_data;
+                node->padding[0] = node->padding[1] = node->padding[2] = node->padding[3] = pts;
+            }
+            break;
+
+        case ATTR_PADDING_L:
+            if (node->padding[0] == 0) {
+                node->padding[0] = (val_type == 0x05) ? dx_ui_decode_dimension_int(val_data) : (int32_t)val_data;
+            }
+            break;
+        case ATTR_PADDING_T:
+            if (node->padding[1] == 0) {
+                node->padding[1] = (val_type == 0x05) ? dx_ui_decode_dimension_int(val_data) : (int32_t)val_data;
+            }
+            break;
+        case ATTR_PADDING_R:
+            if (node->padding[2] == 0) {
+                node->padding[2] = (val_type == 0x05) ? dx_ui_decode_dimension_int(val_data) : (int32_t)val_data;
+            }
+            break;
+        case ATTR_PADDING_B:
+            if (node->padding[3] == 0) {
+                node->padding[3] = (val_type == 0x05) ? dx_ui_decode_dimension_int(val_data) : (int32_t)val_data;
+            }
+            break;
+
+        case ATTR_LAYOUT_MARGIN:
+            if (node->margin[0] == 0 && node->margin[1] == 0 &&
+                node->margin[2] == 0 && node->margin[3] == 0) {
+                int32_t pts = (val_type == 0x05) ? dx_ui_decode_dimension_int(val_data) : (int32_t)val_data;
+                node->margin[0] = node->margin[1] = node->margin[2] = node->margin[3] = pts;
+            }
+            break;
+
+        case ATTR_LAYOUT_WIDTH:
+            // Don't override if already set to something explicit
+            break;
+        case ATTR_LAYOUT_HEIGHT:
+            break;
+
+        case ATTR_VISIBILITY:
+            if (node->visibility == DX_VISIBLE) {
+                if (val_data == 4) node->visibility = DX_INVISIBLE;
+                else if (val_data == 8) node->visibility = DX_GONE;
+            }
+            break;
+
+        default:
+            // Ignore attributes we don't handle yet
+            break;
+    }
+}
+
+// Apply all attributes from a resolved style bag to a node (as defaults).
+// Direct XML attributes that were already parsed take precedence.
+static void apply_style_to_node(DxUINode *node, DxContext *ctx,
+                                 const DxStyleBag *style,
+                                 char **strings, uint32_t string_count) {
+    if (!style || !node) return;
+    for (uint32_t i = 0; i < style->entry_count; i++) {
+        apply_style_attr_to_node(node, ctx,
+                                  style->entries[i].attr_id,
+                                  style->entries[i].value_type,
+                                  style->entries[i].value_data,
+                                  strings, string_count);
+    }
 }
 
 DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_size,
@@ -516,6 +817,9 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
             DxUINode *node = dx_ui_node_create(vtype, 0);
             if (!node) break;
 
+            // Track style resource ID for this element
+            uint32_t style_res_id = 0;
+
             // Parse attributes
             uint32_t attr_start = pos + 36;
             for (uint16_t a = 0; a < attr_count; a++) {
@@ -535,6 +839,28 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
 
                 const char *attr_name = (attr_name_idx < string_count && strings) ?
                                           strings[attr_name_idx] : "";
+
+                // Detect style="@style/..." attribute.
+                // In binary AXML, the style attribute has namespace index 0xFFFFFFFF
+                // and name "style", or attr_res_id == 0x010100ba.
+                // The value is a resource reference (type 0x01) to the style.
+                if (strcmp(attr_name, "style") == 0 || attr_res_id == ATTR_STYLE) {
+                    if (attr_type == 0x01) { // resource reference
+                        style_res_id = attr_data;
+                    }
+                    continue; // style is not a view attribute
+                }
+
+                // Resolve ?attr/ references (type 0x02) through the theme
+                if (attr_type == RES_VALUE_TYPE_ATTR && ctx && ctx->theme) {
+                    uint8_t resolved_type = (uint8_t)attr_type;
+                    uint32_t resolved_data = attr_data;
+                    resolve_attr_reference(ctx, &resolved_type, &resolved_data);
+                    if (resolved_type != RES_VALUE_TYPE_ATTR) {
+                        attr_type = resolved_type;
+                        attr_data = resolved_data;
+                    }
+                }
 
                 // android:id
                 if (attr_res_id == ATTR_ID || strcmp(attr_name, "id") == 0) {
@@ -863,6 +1189,16 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                         conv.u = attr_data;
                         node->constraints.vertical_bias = conv.f;
                     }
+                }
+            }
+
+            // Apply style attributes as defaults (direct attrs take precedence)
+            if (style_res_id != 0 && ctx && ctx->resources) {
+                DxStyleBag *style = dx_resources_resolve_style(ctx->resources, style_res_id);
+                if (style) {
+                    apply_style_to_node(node, ctx, style, strings, string_count);
+                    dx_style_bag_free(style);
+                    DX_TRACE(TAG, "Applied style 0x%08x to <%s>", style_res_id, tag);
                 }
             }
 

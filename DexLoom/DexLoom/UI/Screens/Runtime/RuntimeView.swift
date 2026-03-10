@@ -1,4 +1,5 @@
 import SwiftUI
+import WebKit
 
 struct RuntimeView: View {
     @ObservedObject var bridge: RuntimeBridge
@@ -113,10 +114,12 @@ struct AndroidViewRenderer: View {
            && node.children.isEmpty {
             leafView
                 .applyAndroidStyle(node: node)
+                .applyGestures(node: node, bridge: bridge)
         } else {
             // Container views
             containerView
                 .applyAndroidStyle(node: node)
+                .applyGestures(node: node, bridge: bridge)
         }
     }
 
@@ -165,7 +168,7 @@ struct AndroidViewRenderer: View {
             chipView
 
         case DX_VIEW_WEB_VIEW:
-            webViewPlaceholder
+            webViewRendered
 
         case DX_VIEW_VIEW:
             // Generic <View/> — spacer or divider
@@ -225,6 +228,9 @@ struct AndroidViewRenderer: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+        case DX_VIEW_SWIPE_REFRESH:
+            SwipeRefreshContainerView(node: node, bridge: bridge)
 
         case DX_VIEW_CARD_VIEW:
             VStack(alignment: .leading, spacing: 0) {
@@ -472,17 +478,10 @@ struct AndroidViewRenderer: View {
             )
     }
 
-    private var webViewPlaceholder: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "globe")
-                .font(.system(size: 32))
-                .foregroundStyle(.secondary)
-            Text("WebView")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, minHeight: 100)
-        .background(Color.gray.opacity(0.05))
+    private var webViewRendered: some View {
+        WebViewWrapper(url: node.webURL, html: node.webHTML)
+            .frame(maxWidth: .infinity, minHeight: 200)
+            .frame(height: node.height > 0 ? dp(node.height) : 300)
     }
 
     // MARK: - Gravity helpers
@@ -653,6 +652,87 @@ extension View {
 extension View {
     fileprivate func applyAndroidStyle(node: RenderNode) -> some View {
         modifier(AndroidStyleModifier(node: node))
+    }
+}
+
+/// Applies tap and long-press gestures to views that have registered listeners.
+/// Button and FAB views already handle clicks via SwiftUI Button, so they are excluded
+/// from the tap gesture to avoid double-firing.
+private struct GestureModifier: ViewModifier {
+    let node: RenderNode
+    let bridge: RuntimeBridge
+
+    /// View types that already handle clicks via their own SwiftUI Button wrapper
+    private var isButtonType: Bool {
+        node.type == DX_VIEW_BUTTON || node.type == DX_VIEW_FAB
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .applyTapGesture(
+                hasListener: node.hasClickListener && !isButtonType,
+                viewId: node.viewId,
+                bridge: bridge
+            )
+            .applyLongPressGesture(
+                hasListener: node.hasLongClickListener,
+                viewId: node.viewId,
+                bridge: bridge
+            )
+    }
+}
+
+extension View {
+    fileprivate func applyGestures(node: RenderNode, bridge: RuntimeBridge) -> some View {
+        modifier(GestureModifier(node: node, bridge: bridge))
+    }
+
+    @ViewBuilder
+    fileprivate func applyTapGesture(hasListener: Bool, viewId: UInt32, bridge: RuntimeBridge) -> some View {
+        if hasListener {
+            self.contentShape(Rectangle())
+                .onTapGesture {
+                    bridge.dispatchClick(viewId: viewId)
+                }
+        } else {
+            self
+        }
+    }
+
+    @ViewBuilder
+    fileprivate func applyLongPressGesture(hasListener: Bool, viewId: UInt32, bridge: RuntimeBridge) -> some View {
+        if hasListener {
+            self.onLongPressGesture {
+                bridge.dispatchLongClick(viewId: viewId)
+            }
+        } else {
+            self
+        }
+    }
+}
+
+/// SwipeRefreshLayout rendered as a ScrollView with pull-to-refresh support
+private struct SwipeRefreshContainerView: View {
+    let node: RenderNode
+    let bridge: RuntimeBridge
+    @State private var isRefreshing = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(node.children) { child in
+                    AndroidViewRenderer(node: child, bridge: bridge)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .refreshable {
+            isRefreshing = true
+            bridge.dispatchRefresh(viewId: node.viewId)
+            // Brief delay so the spinner is visible
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            isRefreshing = false
+        }
     }
 }
 
@@ -955,5 +1035,46 @@ private struct EditTextFieldView: View {
             .onChange(of: text) { _, newValue in
                 bridge.updateEditText(viewId: viewId, text: newValue)
             }
+    }
+}
+
+// MARK: - WKWebView wrapper for android.webkit.WebView
+
+private struct WebViewWrapper: UIViewRepresentable {
+    let url: String?
+    let html: String?
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.defaultWebpagePreferences.allowsContentJavaScript = true
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.isOpaque = false
+        webView.backgroundColor = .white
+        webView.scrollView.isScrollEnabled = true
+        loadContent(into: webView)
+        return webView
+    }
+
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        // Reload content when URL or HTML changes
+        loadContent(into: webView)
+    }
+
+    private func loadContent(into webView: WKWebView) {
+        if let html = html, !html.isEmpty {
+            webView.loadHTMLString(html, baseURL: nil)
+        } else if let urlString = url, !urlString.isEmpty,
+                  let parsedURL = URL(string: urlString) {
+            webView.load(URLRequest(url: parsedURL))
+        } else {
+            // No content specified - show blank page with placeholder
+            let placeholder = """
+            <html><body style="display:flex;align-items:center;justify-content:center;\
+            height:100vh;margin:0;font-family:-apple-system;color:#999;">\
+            <div style="text-align:center"><div style="font-size:48px">&#127760;</div>\
+            <div>WebView</div></div></body></html>
+            """
+            webView.loadHTMLString(placeholder, baseURL: nil)
+        }
     }
 }

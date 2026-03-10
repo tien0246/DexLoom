@@ -6,6 +6,9 @@ struct LogsView: View {
     @State private var filterLevel: String = "ALL"
     @State private var autoScroll = true
     @State private var showCopiedToast = false
+    @State private var showDiagnostics = false
+    @State private var diagnosticText: String = ""
+    @State private var diagnosticTitle: String = ""
 
     private let levels = ["ALL", "TRACE", "DEBUG", "INFO", "WARN", "ERROR"]
 
@@ -126,6 +129,33 @@ struct LogsView: View {
                         } label: {
                             Label("Copy Errors Only", systemImage: "exclamationmark.triangle")
                         }
+
+                        Divider()
+
+                        // Diagnostics
+                        Button {
+                            diagnosticTitle = "UI Tree"
+                            diagnosticText = bridge.dumpUITree()
+                            showDiagnostics = true
+                        } label: {
+                            Label("UI Tree Inspector", systemImage: "list.bullet.indent")
+                        }
+
+                        Button {
+                            diagnosticTitle = "Heap Stats"
+                            diagnosticText = bridge.heapStats()
+                            showDiagnostics = true
+                        } label: {
+                            Label("Heap Inspector", systemImage: "memorychip")
+                        }
+
+                        Button {
+                            diagnosticTitle = "Error Detail"
+                            diagnosticText = bridge.lastErrorDetail()
+                            showDiagnostics = true
+                        } label: {
+                            Label("Last Error Detail", systemImage: "ladybug")
+                        }
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
@@ -145,6 +175,55 @@ struct LogsView: View {
                     }
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .animation(.easeInOut(duration: 0.3), value: showCopiedToast)
+                }
+            }
+            .sheet(isPresented: $showDiagnostics) {
+                DiagnosticSheetView(
+                    title: diagnosticTitle,
+                    content: diagnosticText,
+                    onCopy: {
+                        UIPasteboard.general.string = diagnosticText
+                        showCopiedToast = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            showCopiedToast = false
+                        }
+                    }
+                )
+            }
+        }
+    }
+}
+
+// MARK: - Diagnostic Sheet
+
+struct DiagnosticSheetView: View {
+    let title: String
+    let content: String
+    let onCopy: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(content)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Color.dxText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .background(Color.dxBackground)
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        onCopy()
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
                 }
             }
         }

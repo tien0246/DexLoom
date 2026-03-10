@@ -73,6 +73,10 @@ struct DxUINode {
     uint8_t     *image_data;       // PNG/JPEG bytes (owned, freed on destroy)
     uint32_t     image_data_len;   // length of image_data
 
+    // WebView data
+    char        *web_url;          // URL to load (owned, freed on destroy)
+    char        *web_html;         // HTML content to load (owned, freed on destroy)
+
     // Click listener (reference to DxObject implementing OnClickListener)
     DxObject    *click_listener;
 
@@ -129,6 +133,10 @@ typedef struct DxRenderNode {
     const uint8_t *image_data;     // PNG/JPEG bytes (NOT owned - points into DxUINode data)
     uint32_t       image_data_len;
 
+    // WebView data
+    char        *web_url;          // URL to load (owned copy)
+    char        *web_html;         // HTML content to load (owned copy)
+
     struct DxRenderNode *children;
     uint32_t     child_count;
 } DxRenderNode;
@@ -158,5 +166,8 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
 // Dimension unit conversion (dp/sp/px -> iOS points)
 float dx_ui_dp_to_points(float dp);
 float dx_ui_sp_to_points(float sp);
+
+// UI tree inspector - returns a malloc'd string showing the tree hierarchy
+char *dx_ui_tree_dump(DxUINode *root);
 
 #endif // DX_VIEW_H

@@ -23,6 +23,10 @@ struct DxContext {
     // Parsed resources.arsc (persisted for runtime lookups)
     DxResources *resources;
 
+    // Resolved application theme (from android:theme in manifest)
+    uint32_t     theme_res_id;    // style resource ID (0 = none)
+    DxTheme     *theme;           // resolved theme bag (NULL = none)
+
     // Resource tables
     char        **string_resources;   // indexed by resource ID offset
     uint32_t    string_resource_count;

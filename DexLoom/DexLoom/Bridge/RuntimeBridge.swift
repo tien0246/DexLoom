@@ -89,6 +89,8 @@ struct RenderNode: Identifiable {
     let textColor: UInt32
     let isChecked: Bool
     let hasClickListener: Bool
+    let hasLongClickListener: Bool
+    let hasRefreshListener: Bool
     let relativeFlags: UInt16     // RelativeLayout positioning bit flags
     let relAbove: UInt32          // layout_above view ID
     let relBelow: UInt32          // layout_below view ID
@@ -96,6 +98,8 @@ struct RenderNode: Identifiable {
     let relRightOf: UInt32        // layout_toRightOf view ID
     let constraints: ConstraintAnchors  // ConstraintLayout constraints
     let imageData: Data?          // PNG/JPEG bytes for ImageView
+    let webURL: String?           // URL for WebView
+    let webHTML: String?          // HTML content for WebView
     let children: [RenderNode]
 }
 
@@ -276,6 +280,48 @@ final class RuntimeBridge: ObservableObject {
         }
     }
 
+    func dispatchLongClick(viewId: UInt32) {
+        guard let ctx = context else { return }
+        addLog(level: "DEBUG", tag: "Bridge", message: "Long-click on view 0x\(String(viewId, radix: 16))")
+
+        Task.detached { [weak self] in
+            let result = dx_runtime_dispatch_long_click(ctx, viewId)
+
+            await MainActor.run {
+                guard let self = self else { return }
+                if result != DX_OK {
+                    let errStr = String(cString: dx_result_string(result))
+                    self.addLog(level: "WARN", tag: "Bridge", message: "Long-click dispatch failed: \(errStr)")
+                }
+                // Refresh render tree
+                if let model = dx_runtime_get_render_model(ctx) {
+                    self.renderTree = RuntimeBridge.convertRenderModel(model.pointee.root)
+                }
+            }
+        }
+    }
+
+    func dispatchRefresh(viewId: UInt32) {
+        guard let ctx = context else { return }
+        addLog(level: "DEBUG", tag: "Bridge", message: "Refresh on view 0x\(String(viewId, radix: 16))")
+
+        Task.detached { [weak self] in
+            let result = dx_runtime_dispatch_refresh(ctx, viewId)
+
+            await MainActor.run {
+                guard let self = self else { return }
+                if result != DX_OK {
+                    let errStr = String(cString: dx_result_string(result))
+                    self.addLog(level: "WARN", tag: "Bridge", message: "Refresh dispatch failed: \(errStr)")
+                }
+                // Refresh render tree
+                if let model = dx_runtime_get_render_model(ctx) {
+                    self.renderTree = RuntimeBridge.convertRenderModel(model.pointee.root)
+                }
+            }
+        }
+    }
+
     func updateEditText(viewId: UInt32, text: String) {
         guard let ctx = context else { return }
         text.withCString { cStr in
@@ -312,6 +358,36 @@ final class RuntimeBridge: ObservableObject {
         isLoaded = false
         isRunning = false
         renderTree = nil
+    }
+
+    // MARK: - Diagnostics
+
+    /// Dump the UI tree hierarchy as a formatted string
+    func dumpUITree() -> String {
+        guard let ctx = context else { return "(no context)" }
+        guard let root = ctx.pointee.ui_root else { return "(no UI tree)" }
+        guard let cStr = dx_ui_tree_dump(root) else { return "(dump failed)" }
+        let result = String(cString: cStr)
+        dx_free(cStr)
+        return result
+    }
+
+    /// Get heap statistics as a formatted string
+    func heapStats() -> String {
+        guard let ctx = context, let vm = ctx.pointee.vm else { return "(no VM)" }
+        guard let cStr = dx_vm_heap_stats(vm) else { return "(stats failed)" }
+        let result = String(cString: cStr)
+        dx_free(cStr)
+        return result
+    }
+
+    /// Get last error detail with register snapshot and stack trace
+    func lastErrorDetail() -> String {
+        guard let ctx = context, let vm = ctx.pointee.vm else { return "(no VM)" }
+        guard let cStr = dx_vm_get_last_error_detail(vm) else { return "(no detail)" }
+        let result = String(cString: cStr)
+        dx_free(cStr)
+        return result
     }
 
     /// Copy all logs as text (for sharing/debugging)
@@ -407,6 +483,8 @@ final class RuntimeBridge: ObservableObject {
             textColor: n.text_color,
             isChecked: n.is_checked,
             hasClickListener: n.has_click_listener,
+            hasLongClickListener: n.has_long_click_listener,
+            hasRefreshListener: n.has_refresh_listener,
             relativeFlags: n.relative_flags,
             relAbove: n.rel_above,
             relBelow: n.rel_below,
@@ -414,6 +492,8 @@ final class RuntimeBridge: ObservableObject {
             relRightOf: n.rel_right_of,
             constraints: anchors,
             imageData: imgData,
+            webURL: n.web_url.map { String(cString: $0) },
+            webHTML: n.web_html.map { String(cString: $0) },
             children: children
         )
     }

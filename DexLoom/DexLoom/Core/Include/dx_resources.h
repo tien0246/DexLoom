@@ -3,6 +3,9 @@
 
 #include "dx_types.h"
 
+// Forward declaration
+typedef struct DxStyleRecord DxStyleRecord;
+
 // Resource value types (from Android's ResourceTypes.h)
 typedef enum {
     DX_RES_TYPE_NULL     = 0,
@@ -75,6 +78,11 @@ typedef struct {
     DxResourceEntry *entries;
     uint32_t entry_count;
     uint32_t entry_capacity;
+
+    // Style bag records (parsed from complex/bag entries in resources.arsc)
+    DxStyleRecord *styles;
+    uint32_t style_count;
+    uint32_t style_capacity;
 } DxResources;
 
 DxResult dx_resources_parse(const uint8_t *data, uint32_t size, DxResources **out);
@@ -105,5 +113,62 @@ char *dx_resources_format_dimen(float value, uint8_t unit);
 
 // Format a color value as "#AARRGGBB" string, caller must free
 char *dx_resources_format_color(uint32_t argb);
+
+// ============================================================
+// Style / Theme resolution
+// ============================================================
+
+// A single attribute within a style bag (attr_id -> typed value)
+typedef struct {
+    uint32_t attr_id;       // attribute resource ID (e.g., 0x01010098 = textColor)
+    uint8_t  value_type;    // DxResValueType
+    uint32_t value_data;    // raw value data (color, ref, int, dimension, etc.)
+} DxStyleEntry;
+
+// A resolved style bag: array of attribute key-value pairs
+typedef struct {
+    DxStyleEntry *entries;
+    uint32_t      entry_count;
+    uint32_t      parent_id;    // parent style resource ID (0 = none)
+} DxStyleBag;
+
+// Internal storage for parsed style bags
+struct DxStyleRecord {
+    uint32_t    style_res_id; // resource ID of this style
+    uint32_t    parent_id;    // parent style resource ID (0 = none)
+    DxStyleEntry *entries;
+    uint32_t     entry_count;
+};
+
+// Resolve a style resource ID into a flattened bag of attribute entries.
+// Follows parent chain up to 20 levels. Child entries override parent entries.
+// Caller must free the returned DxStyleBag and its entries array with dx_style_bag_free().
+DxStyleBag *dx_resources_resolve_style(const DxResources *res, uint32_t style_res_id);
+
+// Free a DxStyleBag returned by dx_resources_resolve_style
+void dx_style_bag_free(DxStyleBag *bag);
+
+// Resolve a ?attr/ reference through a theme style bag.
+// Given a theme (resolved style bag) and an attribute resource ID,
+// returns the concrete value entry from the theme, or NULL if not found.
+const DxStyleEntry *dx_style_bag_find_attr(const DxStyleBag *bag, uint32_t attr_id);
+
+// ============================================================
+// Theme
+// ============================================================
+
+// A resolved theme: essentially a flattened style bag from the theme resource
+typedef struct {
+    uint32_t    theme_res_id;   // the style resource ID for this theme
+    DxStyleBag *bag;            // resolved attribute bag
+} DxTheme;
+
+// Create a theme from a style resource ID. Caller must free with dx_theme_free().
+DxTheme *dx_theme_create(const DxResources *res, uint32_t theme_res_id);
+void     dx_theme_free(DxTheme *theme);
+
+// Resolve a ?attr/ reference: given an attribute ID, look it up in the theme
+// and return the concrete value. Returns NULL if not resolvable.
+const DxStyleEntry *dx_theme_resolve_attr(const DxTheme *theme, uint32_t attr_id);
 
 #endif // DX_RESOURCES_H

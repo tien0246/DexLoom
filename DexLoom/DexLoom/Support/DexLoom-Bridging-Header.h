@@ -11,5 +11,6 @@
 #include "../Core/Include/dx_vm.h"
 #include "../Core/Include/dx_view.h"
 #include "../Core/Include/dx_runtime.h"
+#include "../Core/Include/dx_memory.h"
 
 #endif
