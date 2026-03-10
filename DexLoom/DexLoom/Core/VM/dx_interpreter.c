@@ -156,6 +156,54 @@ static uint32_t find_catch_handler(DxVM *vm, DxFrame *frame, const uint16_t *ins
     return UINT32_MAX;
 }
 
+// Find a catch-all (finally) handler covering the given pc.
+// Unlike find_catch_handler, this does NOT require an exception — it is used
+// on normal return paths to ensure finally blocks execute.
+// Returns the handler address or UINT32_MAX if no catch-all covers this pc.
+static uint32_t find_finally_handler(const uint16_t *insns, uint32_t insns_size,
+                                      uint16_t tries_size, uint32_t pc) {
+    if (tries_size == 0) return UINT32_MAX;
+
+    const uint8_t *insns_end = (const uint8_t *)(insns + insns_size);
+    if (insns_size & 1) {
+        insns_end += 2;
+    }
+    const uint8_t *try_data = insns_end;
+
+    // Search all try_items covering this pc
+    for (uint16_t i = 0; i < tries_size; i++) {
+        const uint8_t *entry = try_data + (i * 8);
+        uint32_t start_addr = entry[0] | (entry[1] << 8) | (entry[2] << 16) | (entry[3] << 24);
+        uint16_t insn_count_val = entry[4] | (entry[5] << 8);
+        uint16_t handler_off = entry[6] | (entry[7] << 8);
+
+        if (pc >= start_addr && pc < start_addr + insn_count_val) {
+            // Parse encoded_catch_handler to check for catch-all
+            const uint8_t *handlers_base = try_data + (tries_size * 8);
+            const uint8_t *handler_ptr = handlers_base + handler_off;
+            int32_t handler_size = interp_read_sleb128(&handler_ptr);
+            bool has_catch_all = (handler_size <= 0);
+            int32_t abs_size = handler_size < 0 ? -handler_size : handler_size;
+
+            // Skip over typed handlers
+            for (int32_t j = 0; j < abs_size; j++) {
+                (void)interp_read_uleb128(&handler_ptr); // type_idx
+                (void)interp_read_uleb128(&handler_ptr); // addr
+            }
+
+            if (has_catch_all) {
+                uint32_t catch_all_addr = interp_read_uleb128(&handler_ptr);
+                // Only return it if the handler is outside the try block range
+                // (to avoid looping back into the same try block endlessly)
+                if (catch_all_addr < start_addr || catch_all_addr >= start_addr + insn_count_val) {
+                    return catch_all_addr;
+                }
+            }
+        }
+    }
+    return UINT32_MAX;
+}
+
 // Decode register arguments from 35c format (invoke-kind)
 static void decode_35c_args(const uint16_t *insns, uint32_t pc,
                              uint8_t *arg_count, uint8_t args[5]) {
@@ -168,6 +216,42 @@ static void decode_35c_args(const uint16_t *insns, uint32_t pc,
     args[2] = (arg_word >> 8) & 0x0F;
     args[3] = (arg_word >> 12) & 0x0F;
     args[4] = (inst >> 8) & 0x0F;  // for 5-arg case, vG is in the A field
+}
+
+// Pack trailing arguments into an Object[] for varargs methods.
+// fixed_params is the number of declared (non-varargs) parameters (excluding 'this').
+// is_static: true if the method is static (no implicit 'this' argument).
+// args/argc are the original arguments; on return they are rewritten in-place.
+// Returns the new argc. The packed array is allocated on the VM heap.
+static uint8_t pack_varargs(DxVM *vm, DxValue *args, uint8_t argc,
+                            uint32_t fixed_params, bool is_static) {
+    // 'this' occupies args[0] for instance methods
+    uint32_t this_offset = is_static ? 0 : 1;
+    // Index in args[] where the vararg values start
+    uint32_t vararg_start = this_offset + fixed_params;
+
+    if (vararg_start > argc) {
+        // Fewer args than fixed params -- nothing to pack (shouldn't happen normally)
+        return argc;
+    }
+
+    uint32_t vararg_count = argc - vararg_start;
+
+    // Allocate an Object[] array on the VM heap
+    DxObject *arr = dx_vm_alloc_array(vm, vararg_count);
+    if (!arr) {
+        // OOM -- leave args unchanged; the callee will see raw args
+        return argc;
+    }
+
+    // Copy trailing args into the array
+    for (uint32_t i = 0; i < vararg_count; i++) {
+        arr->array_elements[i] = args[vararg_start + i];
+    }
+
+    // Replace the trailing args with the single array argument
+    args[vararg_start] = DX_OBJ_VALUE(arr);
+    return (uint8_t)(vararg_start + 1);
 }
 
 // Resolve and execute an invoke instruction
@@ -250,6 +334,14 @@ static DxResult handle_invoke(DxVM *vm, DxFrame *frame, const uint16_t *code,
     DxValue call_args[5];
     for (uint8_t i = 0; i < argc && i < 5; i++) {
         call_args[i] = frame->registers[arg_regs[i]];
+    }
+
+    // Varargs packing: if target has ACC_VARARGS, pack trailing args into Object[]
+    if ((target->access_flags & DX_ACC_VARARGS) && target->shorty) {
+        uint32_t fixed_params = (uint32_t)(strlen(target->shorty) - 1); // shorty[0] is return type
+        if (fixed_params > 0) fixed_params--; // last declared param is the varargs array
+        bool is_static = (target->access_flags & DX_ACC_STATIC) != 0;
+        argc = pack_varargs(vm, call_args, argc, fixed_params, is_static);
     }
 
     DxValue call_result;
@@ -380,6 +472,14 @@ static DxResult handle_invoke_range(DxVM *vm, DxFrame *frame, const uint16_t *co
         if (reg < DX_MAX_REGISTERS) {
             call_args[i] = frame->registers[reg];
         }
+    }
+
+    // Varargs packing: if target has ACC_VARARGS, pack trailing args into Object[]
+    if ((target->access_flags & DX_ACC_VARARGS) && target->shorty) {
+        uint32_t fixed_params = (uint32_t)(strlen(target->shorty) - 1);
+        if (fixed_params > 0) fixed_params--; // last declared param is the varargs array
+        bool is_static = (target->access_flags & DX_ACC_STATIC) != 0;
+        clamped_argc = pack_varargs(vm, call_args, clamped_argc, fixed_params, is_static);
     }
 
     DxValue call_result;
@@ -773,14 +873,37 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             break;
         }
 
-        case 0x0E: // return-void
+        case 0x0E: { // return-void
+            // Check for finally (catch-all) blocks covering this return
+            if (method->code.tries_size > 0) {
+                uint32_t finally_addr = find_finally_handler(code, code_size,
+                                                              method->code.tries_size, pc);
+                if (finally_addr != UINT32_MAX) {
+                    DX_DEBUG(TAG, "return-void inside try-finally, running finally at %u", finally_addr);
+                    frame->exception = NULL; // no exception on normal return
+                    pc = finally_addr;
+                    break;
+                }
+            }
             goto done;
+        }
 
         case 0x0F: { // return vAA
             uint8_t src = (inst >> 8) & 0xFF;
             frame->result = frame->registers[src];
             frame->has_result = true;
             if (result) *result = frame->registers[src];
+            // Check for finally blocks covering this return
+            if (method->code.tries_size > 0) {
+                uint32_t finally_addr = find_finally_handler(code, code_size,
+                                                              method->code.tries_size, pc);
+                if (finally_addr != UINT32_MAX) {
+                    DX_DEBUG(TAG, "return inside try-finally, running finally at %u", finally_addr);
+                    frame->exception = NULL;
+                    pc = finally_addr;
+                    break;
+                }
+            }
             goto done;
         }
 
@@ -789,6 +912,16 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             frame->result = frame->registers[src];
             frame->has_result = true;
             if (result) *result = frame->registers[src];
+            if (method->code.tries_size > 0) {
+                uint32_t finally_addr = find_finally_handler(code, code_size,
+                                                              method->code.tries_size, pc);
+                if (finally_addr != UINT32_MAX) {
+                    DX_DEBUG(TAG, "return-wide inside try-finally, running finally at %u", finally_addr);
+                    frame->exception = NULL;
+                    pc = finally_addr;
+                    break;
+                }
+            }
             goto done;
         }
 
@@ -797,6 +930,16 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             frame->result = frame->registers[src];
             frame->has_result = true;
             if (result) *result = frame->registers[src];
+            if (method->code.tries_size > 0) {
+                uint32_t finally_addr = find_finally_handler(code, code_size,
+                                                              method->code.tries_size, pc);
+                if (finally_addr != UINT32_MAX) {
+                    DX_DEBUG(TAG, "return-object inside try-finally, running finally at %u", finally_addr);
+                    frame->exception = NULL;
+                    pc = finally_addr;
+                    break;
+                }
+            }
             goto done;
         }
 
@@ -962,7 +1105,8 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
             uint8_t obj_reg = (inst >> 12) & 0x0F;
             uint16_t type_idx = code[pc + 1];
 
-            DxObject *obj = frame->registers[obj_reg].obj;
+            DxObject *obj = (frame->registers[obj_reg].tag == DX_VAL_OBJ)
+                            ? frame->registers[obj_reg].obj : NULL;
             if (!obj) {
                 frame->registers[dst] = DX_INT_VALUE(0);
             } else {
@@ -2057,6 +2201,30 @@ DxResult dx_vm_execute_method(DxVM *vm, DxMethod *method, DxValue *args,
 
 done:
     #undef CODE_AT
+
+    // Before leaving the method on an exception path, check if the current PC
+    // falls inside a try block with a catch-all (finally) handler that wasn't
+    // already tried by the inline exception dispatch.  This covers cases where
+    // an exception was created + goto done without going through find_catch_handler
+    // (e.g. some runtime errors), or where find_catch_handler matched a typed
+    // handler but there's also a finally on an outer try block.
+    if (exec_result == DX_ERR_EXCEPTION && vm->pending_exception &&
+        method->code.tries_size > 0) {
+        uint32_t finally_addr = find_catch_handler(vm, frame, code, code_size,
+                                                    method->code.tries_size, pc,
+                                                    vm->pending_exception);
+        if (finally_addr != UINT32_MAX) {
+            DX_DEBUG(TAG, "Exception finally handler at %u in %s.%s (exit path)",
+                     finally_addr,
+                     method->declaring_class ? method->declaring_class->descriptor : "?",
+                     method->name);
+            vm->pending_exception = NULL;
+            exec_result = DX_OK;
+            pc = finally_addr;
+            goto next_instruction;
+        }
+    }
+
     vm->stack_depth--;
     vm->current_frame = frame->caller;
 

@@ -195,8 +195,10 @@ struct AndroidViewRenderer: View {
                 }
             }
 
-        case DX_VIEW_CONSTRAINT_LAYOUT, DX_VIEW_FRAME_LAYOUT:
-            // Approximate: overlay children (constraint solving is impractical)
+        case DX_VIEW_CONSTRAINT_LAYOUT:
+            ConstraintLayoutView(node: node, bridge: bridge)
+
+        case DX_VIEW_FRAME_LAYOUT:
             ZStack(alignment: .topLeading) {
                 childViews
             }
@@ -651,6 +653,278 @@ extension View {
 extension View {
     fileprivate func applyAndroidStyle(node: RenderNode) -> some View {
         modifier(AndroidStyleModifier(node: node))
+    }
+}
+
+// MARK: - ConstraintLayout solver
+
+/// A simplified ConstraintLayout renderer.
+/// For each child, determines horizontal and vertical positioning based on constraint anchors.
+/// Supports: anchoring to parent edges, centering (with bias), and anchoring to sibling edges.
+/// Uses GeometryReader + explicit offsets to place children within a ZStack.
+private let kConstraintParent: UInt32 = 0xFFFFFFFF
+
+private struct ConstraintLayoutView: View {
+    let node: RenderNode
+    let bridge: RuntimeBridge
+
+    var body: some View {
+        GeometryReader { geo in
+            let parentW = geo.size.width
+            let parentH = geo.size.height
+
+            ZStack(alignment: .topLeading) {
+                ForEach(node.children) { child in
+                    let solved = solveChild(child, parentSize: geo.size)
+                    AndroidViewRenderer(node: child, bridge: bridge)
+                        .frame(
+                            width: solved.width,
+                            height: solved.height
+                        )
+                        .frame(
+                            maxWidth: solved.maxWidth,
+                            maxHeight: solved.maxHeight
+                        )
+                        .alignmentGuide(.leading) { _ in -solved.x }
+                        .alignmentGuide(.top) { _ in -solved.y }
+                }
+            }
+            .frame(width: parentW, height: parentH, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, minHeight: constraintLayoutMinHeight)
+    }
+
+    /// Estimate a reasonable minimum height for the ConstraintLayout based on children
+    private var constraintLayoutMinHeight: CGFloat {
+        // If any child has an explicit height, use the max; otherwise use a sensible default
+        var maxH: CGFloat = 0
+        for child in node.children {
+            if child.height > 0 {
+                maxH = max(maxH, dp(child.height) + dp(child.margin.1) + dp(child.margin.3))
+            } else {
+                maxH = max(maxH, 48) // minimum per child
+            }
+        }
+        // For ConstraintLayout with match_parent height, don't restrict
+        if node.height == -1 { return maxH }
+        if node.height > 0 { return dp(node.height) }
+        // wrap_content: sum visible children heights as rough estimate
+        var total: CGFloat = 0
+        for child in node.children {
+            if child.height > 0 {
+                total += dp(child.height) + dp(child.margin.1) + dp(child.margin.3)
+            } else {
+                total += 48
+            }
+        }
+        return max(total, maxH)
+    }
+
+    /// Solved position and size for a child within the ConstraintLayout
+    struct SolvedPosition {
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var width: CGFloat? = nil
+        var height: CGFloat? = nil
+        var maxWidth: CGFloat? = nil
+        var maxHeight: CGFloat? = nil
+    }
+
+    private func solveChild(_ child: RenderNode, parentSize: CGSize) -> SolvedPosition {
+        let c = child.constraints
+        let parentW = parentSize.width
+        let parentH = parentSize.height
+        let marginL = dp(child.margin.0)
+        let marginT = dp(child.margin.1)
+        let marginR = dp(child.margin.2)
+        let marginB = dp(child.margin.3)
+
+        var result = SolvedPosition()
+
+        // Determine child intrinsic width
+        let childW: CGFloat? = child.width > 0 ? dp(child.width) : nil
+        let childH: CGFloat? = child.height > 0 ? dp(child.height) : nil
+
+        // --- Horizontal axis ---
+        let leftEdge = resolveLeftEdge(c, parentW: parentW)
+        let rightEdge = resolveRightEdge(c, parentW: parentW)
+
+        if c.isCenteredH {
+            // Constrained on both sides
+            if let le = leftEdge, let re = rightEdge {
+                let availableW = re - le - marginL - marginR
+                if child.width == 0 || child.width == -1 {
+                    // match_constraint (0dp) or match_parent: stretch to fill
+                    result.x = le + marginL
+                    result.width = max(availableW, 0)
+                } else if let cw = childW {
+                    // Fixed size: center with bias
+                    let slack = availableW - cw
+                    result.x = le + marginL + slack * CGFloat(c.horizontalBias)
+                    result.width = cw
+                } else {
+                    // wrap_content: center with bias
+                    // We don't know intrinsic width, so use maxWidth and let SwiftUI handle it
+                    result.x = le + marginL
+                    result.maxWidth = max(availableW, 0)
+                    // Adjust with bias by offsetting: for default 0.5 bias, center
+                    // For wrap_content centered, just center in the available space
+                }
+            }
+        } else if c.isLeftOnly {
+            if let le = leftEdge {
+                result.x = le + marginL
+            }
+            if let cw = childW { result.width = cw }
+        } else if c.isRightOnly {
+            if let re = rightEdge {
+                if let cw = childW {
+                    result.x = re - marginR - cw
+                    result.width = cw
+                } else {
+                    // wrap_content aligned right - approximate
+                    result.x = max(re - marginR - 100, 0)
+                }
+            }
+        } else {
+            // No horizontal constraints - default to left edge
+            result.x = marginL
+            if let cw = childW { result.width = cw }
+        }
+
+        // --- Vertical axis ---
+        let topEdge = resolveTopEdge(c, parentH: parentH)
+        let bottomEdge = resolveBottomEdge(c, parentH: parentH)
+
+        if c.isCenteredV {
+            if let te = topEdge, let be = bottomEdge {
+                let availableH = be - te - marginT - marginB
+                if child.height == 0 || child.height == -1 {
+                    // match_constraint or match_parent: stretch
+                    result.y = te + marginT
+                    result.height = max(availableH, 0)
+                } else if let ch = childH {
+                    let slack = availableH - ch
+                    result.y = te + marginT + slack * CGFloat(c.verticalBias)
+                    result.height = ch
+                } else {
+                    result.y = te + marginT
+                    result.maxHeight = max(availableH, 0)
+                }
+            }
+        } else if c.isTopOnly {
+            if let te = topEdge {
+                result.y = te + marginT
+            }
+            if let ch = childH { result.height = ch }
+        } else if c.isBottomOnly {
+            if let be = bottomEdge {
+                if let ch = childH {
+                    result.y = be - marginB - ch
+                    result.height = ch
+                } else {
+                    result.y = max(be - marginB - 48, 0)
+                }
+            }
+        } else {
+            // No vertical constraints - default to top
+            result.y = marginT
+            if let ch = childH { result.height = ch }
+        }
+
+        return result
+    }
+
+    /// Resolve the left anchor edge position in parent coordinates
+    private func resolveLeftEdge(_ c: ConstraintAnchors, parentW: CGFloat) -> CGFloat? {
+        if c.leftToLeft == kConstraintParent { return 0 }
+        if c.leftToRight == kConstraintParent { return parentW }
+        if c.leftToLeft != 0 {
+            // Anchored to left edge of sibling - find sibling's right boundary
+            // For simplicity, treat sibling constraints as approximate center positions
+            return findSiblingLeftEdge(c.leftToLeft)
+        }
+        if c.leftToRight != 0 {
+            return findSiblingRightEdge(c.leftToRight)
+        }
+        return nil
+    }
+
+    private func resolveRightEdge(_ c: ConstraintAnchors, parentW: CGFloat) -> CGFloat? {
+        if c.rightToRight == kConstraintParent { return parentW }
+        if c.rightToLeft == kConstraintParent { return 0 }
+        if c.rightToRight != 0 {
+            return findSiblingRightEdge(c.rightToRight)
+        }
+        if c.rightToLeft != 0 {
+            return findSiblingLeftEdge(c.rightToLeft)
+        }
+        return nil
+    }
+
+    private func resolveTopEdge(_ c: ConstraintAnchors, parentH: CGFloat) -> CGFloat? {
+        if c.topToTop == kConstraintParent { return 0 }
+        if c.topToBottom == kConstraintParent { return parentH }
+        if c.topToTop != 0 {
+            return findSiblingTopEdge(c.topToTop)
+        }
+        if c.topToBottom != 0 {
+            return findSiblingBottomEdge(c.topToBottom)
+        }
+        return nil
+    }
+
+    private func resolveBottomEdge(_ c: ConstraintAnchors, parentH: CGFloat) -> CGFloat? {
+        if c.bottomToBottom == kConstraintParent { return parentH }
+        if c.bottomToTop == kConstraintParent { return 0 }
+        if c.bottomToBottom != 0 {
+            return findSiblingBottomEdge(c.bottomToBottom)
+        }
+        if c.bottomToTop != 0 {
+            return findSiblingTopEdge(c.bottomToTop)
+        }
+        return nil
+    }
+
+    // MARK: - Sibling edge estimation
+    // For sibling-to-sibling constraints, we do a simplified single-pass estimation.
+    // We estimate sibling positions based on their own constraints to parent only.
+    // This handles the most common chains (A→parent, B→A's bottom, etc.)
+
+    private func findSiblingLeftEdge(_ viewId: UInt32) -> CGFloat? {
+        // Sibling's left edge is its x position (margin included)
+        guard let sibling = node.children.first(where: { $0.viewId == viewId }) else { return nil }
+        return dp(sibling.margin.0)
+    }
+
+    private func findSiblingRightEdge(_ viewId: UInt32) -> CGFloat? {
+        guard let sibling = node.children.first(where: { $0.viewId == viewId }) else { return nil }
+        let w: CGFloat = sibling.width > 0 ? dp(sibling.width) : 100 // estimate
+        return dp(sibling.margin.0) + w
+    }
+
+    private func findSiblingTopEdge(_ viewId: UInt32) -> CGFloat? {
+        guard let sibling = node.children.first(where: { $0.viewId == viewId }) else { return nil }
+        // If sibling is constrained to parent top, its top is its top margin
+        if sibling.constraints.topToTop == kConstraintParent {
+            return dp(sibling.margin.1)
+        }
+        // If sibling is constrained below another sibling, estimate recursively (1 level)
+        if sibling.constraints.topToBottom != 0 && sibling.constraints.topToBottom != kConstraintParent {
+            if let aboveBottom = findSiblingBottomEdge(sibling.constraints.topToBottom) {
+                return aboveBottom + dp(sibling.margin.1)
+            }
+        }
+        return dp(sibling.margin.1)
+    }
+
+    private func findSiblingBottomEdge(_ viewId: UInt32) -> CGFloat? {
+        guard let sibling = node.children.first(where: { $0.viewId == viewId }) else { return nil }
+        let h: CGFloat = sibling.height > 0 ? dp(sibling.height) : 48 // estimate
+        if let top = findSiblingTopEdge(viewId) {
+            return top + h + dp(sibling.margin.3)
+        }
+        return dp(sibling.margin.1) + h + dp(sibling.margin.3)
     }
 }
 

@@ -9,6 +9,68 @@ struct LogEntry: Identifiable {
     let message: String
 }
 
+/// ConstraintLayout constraint anchors for a child view
+struct ConstraintAnchors {
+    let leftToLeft: UInt32      // 0 = none, 0xFFFFFFFF = parent, else view ID
+    let leftToRight: UInt32
+    let rightToRight: UInt32
+    let rightToLeft: UInt32
+    let topToTop: UInt32
+    let topToBottom: UInt32
+    let bottomToBottom: UInt32
+    let bottomToTop: UInt32
+    let horizontalBias: Float   // 0.0-1.0, default 0.5
+    let verticalBias: Float
+
+    var hasHorizontal: Bool {
+        let hasLeft = leftToLeft != 0 || leftToRight != 0
+        let hasRight = rightToRight != 0 || rightToLeft != 0
+        return hasLeft || hasRight
+    }
+    var hasVertical: Bool {
+        let hasTop = topToTop != 0 || topToBottom != 0
+        let hasBottom = bottomToBottom != 0 || bottomToTop != 0
+        return hasTop || hasBottom
+    }
+    /// True if constrained on both left and right (centered or stretched)
+    var isCenteredH: Bool {
+        let hasLeft = leftToLeft != 0 || leftToRight != 0
+        let hasRight = rightToRight != 0 || rightToLeft != 0
+        return hasLeft && hasRight
+    }
+    /// True if constrained on both top and bottom
+    var isCenteredV: Bool {
+        let hasTop = topToTop != 0 || topToBottom != 0
+        let hasBottom = bottomToBottom != 0 || bottomToTop != 0
+        return hasTop && hasBottom
+    }
+    /// True if only left/start constrained (no right)
+    var isLeftOnly: Bool {
+        let hasLeft = leftToLeft != 0 || leftToRight != 0
+        let hasRight = rightToRight != 0 || rightToLeft != 0
+        return hasLeft && !hasRight
+    }
+    /// True if only right/end constrained (no left)
+    var isRightOnly: Bool {
+        let hasLeft = leftToLeft != 0 || leftToRight != 0
+        let hasRight = rightToRight != 0 || rightToLeft != 0
+        return !hasLeft && hasRight
+    }
+    /// True if only top constrained (no bottom)
+    var isTopOnly: Bool {
+        let hasTop = topToTop != 0 || topToBottom != 0
+        let hasBottom = bottomToBottom != 0 || bottomToTop != 0
+        return hasTop && !hasBottom
+    }
+    /// True if only bottom constrained (no top)
+    var isBottomOnly: Bool {
+        let hasTop = topToTop != 0 || topToBottom != 0
+        let hasBottom = bottomToBottom != 0 || bottomToTop != 0
+        return !hasTop && hasBottom
+    }
+    var hasAny: Bool { hasHorizontal || hasVertical }
+}
+
 struct RenderNode: Identifiable {
     let id = UUID()
     let type: DxViewType
@@ -32,6 +94,7 @@ struct RenderNode: Identifiable {
     let relBelow: UInt32          // layout_below view ID
     let relLeftOf: UInt32         // layout_toLeftOf view ID
     let relRightOf: UInt32        // layout_toRightOf view ID
+    let constraints: ConstraintAnchors  // ConstraintLayout constraints
     let imageData: Data?          // PNG/JPEG bytes for ImageView
     let children: [RenderNode]
 }
@@ -313,6 +376,20 @@ final class RuntimeBridge: ObservableObject {
             imgData = Data(bytes: ptr, count: Int(n.image_data_len))
         }
 
+        let ca = n.constraints
+        let anchors = ConstraintAnchors(
+            leftToLeft: ca.left_to_left,
+            leftToRight: ca.left_to_right,
+            rightToRight: ca.right_to_right,
+            rightToLeft: ca.right_to_left,
+            topToTop: ca.top_to_top,
+            topToBottom: ca.top_to_bottom,
+            bottomToBottom: ca.bottom_to_bottom,
+            bottomToTop: ca.bottom_to_top,
+            horizontalBias: ca.horizontal_bias,
+            verticalBias: ca.vertical_bias
+        )
+
         return RenderNode(
             type: n.type,
             viewId: n.view_id,
@@ -335,6 +412,7 @@ final class RuntimeBridge: ObservableObject {
             relBelow: n.rel_below,
             relLeftOf: n.rel_left_of,
             relRightOf: n.rel_right_of,
+            constraints: anchors,
             imageData: imgData,
             children: children
         )

@@ -111,6 +111,7 @@ typedef enum {
     DX_VIEW_WEB_VIEW,          // android.webkit.WebView
     DX_VIEW_CHIP,              // Material Chip
     DX_VIEW_BOTTOM_NAV,        // BottomNavigationView
+    DX_VIEW_SWIPE_REFRESH,     // SwipeRefreshLayout
 } DxViewType;
 
 // Layout orientation

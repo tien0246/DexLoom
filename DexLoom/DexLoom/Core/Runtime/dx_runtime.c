@@ -1216,6 +1216,83 @@ DxResult dx_runtime_dispatch_click(DxContext *ctx, uint32_t view_id) {
     return click_res;
 }
 
+DxResult dx_runtime_dispatch_long_click(DxContext *ctx, uint32_t view_id) {
+    if (!ctx || !ctx->vm || !ctx->ui_root) return DX_ERR_NULL_PTR;
+
+    DxUINode *node = dx_ui_node_find_by_id(ctx->ui_root, view_id);
+    if (!node) {
+        DX_WARN(TAG, "Long-click target not found: 0x%x", view_id);
+        return DX_ERR_NOT_FOUND;
+    }
+
+    if (!node->long_click_listener) {
+        DX_DEBUG(TAG, "No long-click listener on view 0x%x", view_id);
+        return DX_OK;
+    }
+
+    DX_INFO(TAG, "Dispatching long-click on view 0x%x", view_id);
+
+    DxObject *listener = node->long_click_listener;
+    DxMethod *on_long_click = dx_vm_find_method(listener->klass, "onLongClick", NULL);
+    if (!on_long_click) {
+        DX_WARN(TAG, "onLongClick method not found on listener class %s",
+                listener->klass->descriptor);
+        return DX_ERR_METHOD_NOT_FOUND;
+    }
+
+    ctx->vm->insn_count = 0;
+    ctx->vm->pending_exception = NULL;
+    DxObject *view_obj = node->runtime_obj;
+    DxValue args[2] = { DX_OBJ_VALUE(listener), DX_OBJ_VALUE(view_obj) };
+    DxResult res = dx_vm_execute_method(ctx->vm, on_long_click, args, 2, NULL);
+    if (res == DX_ERR_EXCEPTION) {
+        const char *exc_desc = ctx->vm->pending_exception && ctx->vm->pending_exception->klass
+            ? ctx->vm->pending_exception->klass->descriptor : "unknown";
+        DX_WARN(TAG, "onLongClick threw uncaught %s (absorbed)", exc_desc);
+        ctx->vm->pending_exception = NULL;
+        res = DX_OK;
+    }
+    return res;
+}
+
+DxResult dx_runtime_dispatch_refresh(DxContext *ctx, uint32_t view_id) {
+    if (!ctx || !ctx->vm || !ctx->ui_root) return DX_ERR_NULL_PTR;
+
+    DxUINode *node = dx_ui_node_find_by_id(ctx->ui_root, view_id);
+    if (!node) {
+        DX_WARN(TAG, "Refresh target not found: 0x%x", view_id);
+        return DX_ERR_NOT_FOUND;
+    }
+
+    if (!node->refresh_listener) {
+        DX_DEBUG(TAG, "No refresh listener on view 0x%x", view_id);
+        return DX_OK;
+    }
+
+    DX_INFO(TAG, "Dispatching refresh on view 0x%x", view_id);
+
+    DxObject *listener = node->refresh_listener;
+    DxMethod *on_refresh = dx_vm_find_method(listener->klass, "onRefresh", NULL);
+    if (!on_refresh) {
+        DX_WARN(TAG, "onRefresh method not found on listener class %s",
+                listener->klass->descriptor);
+        return DX_ERR_METHOD_NOT_FOUND;
+    }
+
+    ctx->vm->insn_count = 0;
+    ctx->vm->pending_exception = NULL;
+    DxValue args[1] = { DX_OBJ_VALUE(listener) };
+    DxResult res = dx_vm_execute_method(ctx->vm, on_refresh, args, 1, NULL);
+    if (res == DX_ERR_EXCEPTION) {
+        const char *exc_desc = ctx->vm->pending_exception && ctx->vm->pending_exception->klass
+            ? ctx->vm->pending_exception->klass->descriptor : "unknown";
+        DX_WARN(TAG, "onRefresh threw uncaught %s (absorbed)", exc_desc);
+        ctx->vm->pending_exception = NULL;
+        res = DX_OK;
+    }
+    return res;
+}
+
 DxResult dx_runtime_update_edit_text(DxContext *ctx, uint32_t view_id, const char *text) {
     if (!ctx || !ctx->vm || !ctx->ui_root) return DX_ERR_NULL_PTR;
 

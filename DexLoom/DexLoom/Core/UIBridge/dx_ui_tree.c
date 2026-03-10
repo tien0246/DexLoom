@@ -84,6 +84,18 @@ DxUINode *dx_ui_node_create(DxViewType type, uint32_t view_id) {
     node->width = -1;   // match_parent
     node->height = -2;  // wrap_content
 
+    // Initialize ConstraintLayout constraints to "none"
+    node->constraints.left_to_left = DX_CONSTRAINT_NONE;
+    node->constraints.left_to_right = DX_CONSTRAINT_NONE;
+    node->constraints.right_to_right = DX_CONSTRAINT_NONE;
+    node->constraints.right_to_left = DX_CONSTRAINT_NONE;
+    node->constraints.top_to_top = DX_CONSTRAINT_NONE;
+    node->constraints.top_to_bottom = DX_CONSTRAINT_NONE;
+    node->constraints.bottom_to_bottom = DX_CONSTRAINT_NONE;
+    node->constraints.bottom_to_top = DX_CONSTRAINT_NONE;
+    node->constraints.horizontal_bias = 0.5f;
+    node->constraints.vertical_bias = 0.5f;
+
     return node;
 }
 
@@ -187,11 +199,14 @@ static DxRenderNode *serialize_node(DxUINode *node) {
     rn->text_color = node->text_color;
     rn->is_checked = node->is_checked;
     rn->has_click_listener = (node->click_listener != NULL);
+    rn->has_long_click_listener = (node->long_click_listener != NULL);
+    rn->has_refresh_listener = (node->refresh_listener != NULL);
     rn->relative_flags = node->relative_flags;
     rn->rel_above = node->rel_above;
     rn->rel_below = node->rel_below;
     rn->rel_left_of = node->rel_left_of;
     rn->rel_right_of = node->rel_right_of;
+    rn->constraints = node->constraints;
     rn->image_data = node->image_data;        // borrow pointer (DxUINode owns the data)
     rn->image_data_len = node->image_data_len;
 
@@ -487,6 +502,7 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
             else if (strstr(tag, "ViewPager") != NULL) vtype = DX_VIEW_VIEW_PAGER;
             else if (strstr(tag, "Chip") != NULL && strstr(tag, "ChipGroup") == NULL) vtype = DX_VIEW_CHIP;
             else if (strstr(tag, "BottomNavigationView") != NULL) vtype = DX_VIEW_BOTTOM_NAV;
+            else if (strstr(tag, "SwipeRefreshLayout") != NULL) vtype = DX_VIEW_SWIPE_REFRESH;
             else if (strstr(tag, "RadioGroup") != NULL) vtype = DX_VIEW_RADIO_GROUP;
             else if (strstr(tag, "CoordinatorLayout") != NULL ||
                      strstr(tag, "AppBarLayout") != NULL ||
@@ -744,6 +760,109 @@ DxResult dx_layout_parse(DxContext *ctx, const uint8_t *xml_data, uint32_t xml_s
                          strcmp(attr_name, "layout_toRightOf") == 0) {
                     node->relative_flags |= DX_REL_RIGHT_OF;
                     node->rel_right_of = attr_data;
+                }
+                // ConstraintLayout constraint attributes (app: namespace, matched by name)
+                // Value is either a view ID (resource reference) or "parent" (string 0x03 → look up)
+                // For resource refs (type 0x01), attr_data is the view ID.
+                // For "parent" string, we use DX_CONSTRAINT_PARENT sentinel.
+                else if (strcmp(attr_name, "layout_constraintLeft_toLeftOf") == 0 ||
+                         strcmp(attr_name, "layout_constraintStart_toStartOf") == 0) {
+                    if (attr_type == 0x01) {
+                        node->constraints.left_to_left = attr_data;
+                    } else if (attr_type == 0x03 && attr_raw < string_count && strings &&
+                               strcmp(strings[attr_raw], "parent") == 0) {
+                        node->constraints.left_to_left = DX_CONSTRAINT_PARENT;
+                    } else {
+                        // Integer 0 often means "parent" in compiled AXML
+                        node->constraints.left_to_left = (attr_data == 0) ? DX_CONSTRAINT_PARENT : attr_data;
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintRight_toRightOf") == 0 ||
+                         strcmp(attr_name, "layout_constraintEnd_toEndOf") == 0) {
+                    if (attr_type == 0x01) {
+                        node->constraints.right_to_right = attr_data;
+                    } else if (attr_type == 0x03 && attr_raw < string_count && strings &&
+                               strcmp(strings[attr_raw], "parent") == 0) {
+                        node->constraints.right_to_right = DX_CONSTRAINT_PARENT;
+                    } else {
+                        node->constraints.right_to_right = (attr_data == 0) ? DX_CONSTRAINT_PARENT : attr_data;
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintTop_toTopOf") == 0) {
+                    if (attr_type == 0x01) {
+                        node->constraints.top_to_top = attr_data;
+                    } else if (attr_type == 0x03 && attr_raw < string_count && strings &&
+                               strcmp(strings[attr_raw], "parent") == 0) {
+                        node->constraints.top_to_top = DX_CONSTRAINT_PARENT;
+                    } else {
+                        node->constraints.top_to_top = (attr_data == 0) ? DX_CONSTRAINT_PARENT : attr_data;
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintBottom_toBottomOf") == 0) {
+                    if (attr_type == 0x01) {
+                        node->constraints.bottom_to_bottom = attr_data;
+                    } else if (attr_type == 0x03 && attr_raw < string_count && strings &&
+                               strcmp(strings[attr_raw], "parent") == 0) {
+                        node->constraints.bottom_to_bottom = DX_CONSTRAINT_PARENT;
+                    } else {
+                        node->constraints.bottom_to_bottom = (attr_data == 0) ? DX_CONSTRAINT_PARENT : attr_data;
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintTop_toBottomOf") == 0) {
+                    if (attr_type == 0x01) {
+                        node->constraints.top_to_bottom = attr_data;
+                    } else if (attr_type == 0x03 && attr_raw < string_count && strings &&
+                               strcmp(strings[attr_raw], "parent") == 0) {
+                        node->constraints.top_to_bottom = DX_CONSTRAINT_PARENT;
+                    } else {
+                        node->constraints.top_to_bottom = (attr_data == 0) ? DX_CONSTRAINT_PARENT : attr_data;
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintBottom_toTopOf") == 0) {
+                    if (attr_type == 0x01) {
+                        node->constraints.bottom_to_top = attr_data;
+                    } else if (attr_type == 0x03 && attr_raw < string_count && strings &&
+                               strcmp(strings[attr_raw], "parent") == 0) {
+                        node->constraints.bottom_to_top = DX_CONSTRAINT_PARENT;
+                    } else {
+                        node->constraints.bottom_to_top = (attr_data == 0) ? DX_CONSTRAINT_PARENT : attr_data;
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintLeft_toRightOf") == 0 ||
+                         strcmp(attr_name, "layout_constraintStart_toEndOf") == 0) {
+                    if (attr_type == 0x01) {
+                        node->constraints.left_to_right = attr_data;
+                    } else if (attr_type == 0x03 && attr_raw < string_count && strings &&
+                               strcmp(strings[attr_raw], "parent") == 0) {
+                        node->constraints.left_to_right = DX_CONSTRAINT_PARENT;
+                    } else {
+                        node->constraints.left_to_right = (attr_data == 0) ? DX_CONSTRAINT_PARENT : attr_data;
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintRight_toLeftOf") == 0 ||
+                         strcmp(attr_name, "layout_constraintEnd_toStartOf") == 0) {
+                    if (attr_type == 0x01) {
+                        node->constraints.right_to_left = attr_data;
+                    } else if (attr_type == 0x03 && attr_raw < string_count && strings &&
+                               strcmp(strings[attr_raw], "parent") == 0) {
+                        node->constraints.right_to_left = DX_CONSTRAINT_PARENT;
+                    } else {
+                        node->constraints.right_to_left = (attr_data == 0) ? DX_CONSTRAINT_PARENT : attr_data;
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintHorizontal_bias") == 0) {
+                    if (attr_type == 0x04) {
+                        union { uint32_t u; float f; } conv;
+                        conv.u = attr_data;
+                        node->constraints.horizontal_bias = conv.f;
+                    }
+                }
+                else if (strcmp(attr_name, "layout_constraintVertical_bias") == 0) {
+                    if (attr_type == 0x04) {
+                        union { uint32_t u; float f; } conv;
+                        conv.u = attr_data;
+                        node->constraints.vertical_bias = conv.f;
+                    }
                 }
             }
 

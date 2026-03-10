@@ -36,11 +36,21 @@ static void append_string(char ***array, uint32_t *count, const char *str) {
 #define ATTR_EXPORTED   0x01010010
 #define ATTR_MIN_SDK    0x0101020c
 #define ATTR_TARGET_SDK 0x01010270
+#define ATTR_REQUIRED   0x0101028e
+#define ATTR_SCHEME     0x01010027
+#define ATTR_HOST       0x01010028
+#define ATTR_PATH       0x0101002a
+#define ATTR_PATH_PREFIX 0x01010098
+#define ATTR_PATH_PATTERN 0x0101002c
+#define ATTR_MIME_TYPE  0x01010026
+#define ATTR_RESOURCE   0x01010025
 
 // Attribute value types
 #define ATTR_TYPE_STRING    0x03
 #define ATTR_TYPE_INT_DEC   0x10
 #define ATTR_TYPE_INT_HEX   0x11
+#define ATTR_TYPE_INT_BOOL  0x12
+#define ATTR_TYPE_REFERENCE 0x01
 
 static uint16_t read_u16(const uint8_t *p) {
     return (uint16_t)(p[0] | (p[1] << 8));
@@ -51,7 +61,6 @@ static uint32_t read_u32(const uint8_t *p) {
 }
 
 // Decode a string from AXML string pool
-// AXML strings can be UTF-8 or UTF-16
 static char *decode_axml_string(const uint8_t *pool_data, uint32_t pool_size,
                                  uint32_t offset, bool is_utf8) {
     if (offset >= pool_size) return dx_strdup("");
@@ -59,7 +68,6 @@ static char *decode_axml_string(const uint8_t *pool_data, uint32_t pool_size,
     const uint8_t *p = pool_data + offset;
 
     if (is_utf8) {
-        // UTF-8: first byte(s) = char count (ULEB128-ish), then byte count, then data
         uint32_t char_count = *p++;
         if (char_count > 0x7F) {
             char_count = ((char_count & 0x7F) << 8) | *p++;
@@ -74,14 +82,12 @@ static char *decode_axml_string(const uint8_t *pool_data, uint32_t pool_size,
         s[byte_count] = '\0';
         return s;
     } else {
-        // UTF-16LE: first 2 bytes = char count, then UTF-16 data
         uint16_t char_count = read_u16(p);
         p += 2;
         if (char_count >= 0x8000) {
             char_count = ((char_count & 0x7FFF) << 16) | read_u16(p);
             p += 2;
         }
-        // Simple ASCII extraction from UTF-16 (sufficient for manifest strings)
         char *s = (char *)dx_malloc(char_count + 1);
         if (!s) return NULL;
         for (uint32_t i = 0; i < char_count; i++) {
@@ -111,7 +117,6 @@ DxResult dx_axml_parse(const uint8_t *data, uint32_t size, DxAxmlParser **out) {
     if (pos + 8 > size) goto fail;
 
     uint16_t chunk_type = read_u16(data + pos);
-    // uint16_t header_size = read_u16(data + pos + 2);
     uint32_t chunk_size = read_u32(data + pos + 4);
 
     if (chunk_type != AXML_CHUNK_STRINGPOOL) {
@@ -119,19 +124,15 @@ DxResult dx_axml_parse(const uint8_t *data, uint32_t size, DxAxmlParser **out) {
         goto fail;
     }
 
-    // String pool header
     uint32_t string_count = read_u32(data + pos + 8);
-    // uint32_t style_count = read_u32(data + pos + 12);
     uint32_t flags = read_u32(data + pos + 16);
     uint32_t strings_start = read_u32(data + pos + 20);
-    // uint32_t styles_start = read_u32(data + pos + 24);
     bool is_utf8 = (flags & (1 << 8)) != 0;
 
     parser->string_count = string_count;
     parser->strings = (char **)dx_malloc(sizeof(char *) * string_count);
     if (!parser->strings) goto fail;
 
-    // String offsets start at pos + 28
     uint32_t offsets_start = pos + 28;
     uint32_t pool_data_start = pos + strings_start;
 
@@ -182,6 +183,98 @@ void dx_axml_free(DxAxmlParser *parser) {
     dx_free(parser);
 }
 
+// ---- Helper: resolve resource ID from attribute name index ----
+static uint32_t resolve_res_id(const DxAxmlParser *axml, uint32_t name_idx) {
+    if (axml->res_ids && name_idx < axml->res_id_count)
+        return axml->res_ids[name_idx];
+    return 0;
+}
+
+// ---- Helper: check if attribute name matches either by res-id or string name ----
+static bool attr_is(const DxAxmlParser *axml, uint32_t name_idx,
+                     uint32_t expected_res_id, const char *fallback_name) {
+    uint32_t rid = resolve_res_id(axml, name_idx);
+    if (rid == expected_res_id) return true;
+    if (fallback_name && name_idx < axml->string_count &&
+        strcmp(axml->strings[name_idx], fallback_name) == 0)
+        return true;
+    return false;
+}
+
+// ---- Helper: get string value from attribute data ----
+static char *attr_string(const DxAxmlParser *axml, uint32_t attr_type, uint32_t attr_data) {
+    if (attr_type == ATTR_TYPE_STRING && attr_data < axml->string_count)
+        return dx_strdup(axml->strings[attr_data]);
+    return NULL;
+}
+
+// ---- Resolve relative class name (prepend package if starts with '.') ----
+static char *resolve_class_name(const char *name, const char *package) {
+    if (!name) return NULL;
+    if (name[0] == '.' && package) {
+        size_t pkg_len = strlen(package);
+        size_t act_len = strlen(name);
+        char *full = (char *)dx_malloc(pkg_len + act_len + 1);
+        if (full) {
+            memcpy(full, package, pkg_len);
+            memcpy(full + pkg_len, name, act_len + 1);
+        }
+        return full;
+    }
+    return dx_strdup(name);
+}
+
+// ---- Component helpers ----
+static DxComponent *append_component(DxComponent **array, uint32_t *count) {
+    uint32_t n = *count;
+    DxComponent *new_arr = (DxComponent *)dx_realloc(*array, sizeof(DxComponent) * (n + 1));
+    if (!new_arr) return NULL;
+    memset(&new_arr[n], 0, sizeof(DxComponent));
+    *array = new_arr;
+    *count = n + 1;
+    return &new_arr[n];
+}
+
+static void append_intent_filter(DxComponent *comp, DxIntentFilter *filter) {
+    uint32_t n = comp->intent_filter_count;
+    DxIntentFilter *new_arr = (DxIntentFilter *)dx_realloc(
+        comp->intent_filters, sizeof(DxIntentFilter) * (n + 1));
+    if (!new_arr) return;
+    new_arr[n] = *filter;
+    comp->intent_filters = new_arr;
+    comp->intent_filter_count = n + 1;
+}
+
+static void append_meta_data(DxMetaData **array, uint32_t *count, const char *name, const char *value) {
+    uint32_t n = *count;
+    DxMetaData *new_arr = (DxMetaData *)dx_realloc(*array, sizeof(DxMetaData) * (n + 1));
+    if (!new_arr) return;
+    new_arr[n].name = name ? dx_strdup(name) : NULL;
+    new_arr[n].value = value ? dx_strdup(value) : NULL;
+    *array = new_arr;
+    *count = n + 1;
+}
+
+static void append_intent_data(DxIntentFilter *filter, DxIntentData *d) {
+    uint32_t n = filter->data_count;
+    DxIntentData *new_arr = (DxIntentData *)dx_realloc(
+        filter->data_entries, sizeof(DxIntentData) * (n + 1));
+    if (!new_arr) return;
+    new_arr[n] = *d;
+    filter->data_entries = new_arr;
+    filter->data_count = n + 1;
+}
+
+// ---- Component type enum for the parser state machine ----
+typedef enum {
+    COMP_NONE = 0,
+    COMP_ACTIVITY,
+    COMP_SERVICE,
+    COMP_RECEIVER,
+    COMP_PROVIDER,
+    COMP_APPLICATION,
+} CompType;
+
 DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out) {
     if (!data || !out) return DX_ERR_NULL_PTR;
 
@@ -195,9 +288,8 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
         return DX_ERR_OUT_OF_MEMORY;
     }
 
-    // Walk the XML tree looking for key elements/attributes
-    // We parse the chunk stream after string pool + resource map
-    uint32_t pos = 8; // skip file header
+    // Walk the XML tree
+    uint32_t pos = 8;
 
     // Skip string pool chunk
     if (pos + 8 <= size) {
@@ -210,35 +302,18 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
         pos += chunk_size;
     }
 
-    bool in_activity = false;
+    // Parser state
+    CompType current_comp_type = COMP_NONE;
+    DxComponent *current_comp = NULL;
     bool in_intent_filter = false;
+    DxIntentFilter current_filter;
+    memset(&current_filter, 0, sizeof(current_filter));
+
     bool found_main = false;
     bool found_launcher = false;
     char *current_activity_name = NULL;
 
-    // Helper: extract android:name string attribute from a tag's attributes
-    // Returns a dx_strdup'd string or NULL
-    #define EXTRACT_NAME_ATTR(out_str) do { \
-        uint32_t _attr_start = pos + 36; \
-        for (uint16_t _a = 0; _a < attr_count; _a++) { \
-            uint32_t _aoff = _attr_start + _a * 20; \
-            if (_aoff + 20 > size) break; \
-            uint32_t _ani = read_u32(data + _aoff + 4); \
-            uint32_t _arid = 0; \
-            if (axml->res_ids && _ani < axml->res_id_count) \
-                _arid = axml->res_ids[_ani]; \
-            uint32_t _atype = read_u32(data + _aoff + 12) >> 24; \
-            uint32_t _adata = read_u32(data + _aoff + 16); \
-            bool _is_name = (_arid == ATTR_NAME) || \
-                (_ani < axml->string_count && \
-                 strcmp(axml->strings[_ani], "name") == 0); \
-            if (_is_name && _atype == ATTR_TYPE_STRING && \
-                _adata < axml->string_count) { \
-                (out_str) = dx_strdup(axml->strings[_adata]); \
-                break; \
-            } \
-        } \
-    } while(0)
+    bool in_application = false;
 
     while (pos + 8 <= size) {
         uint16_t chunk_type = read_u16(data + pos);
@@ -247,7 +322,6 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
         if (chunk_size < 8 || pos + chunk_size > size) break;
 
         if (chunk_type == AXML_CHUNK_START_TAG) {
-            // Start tag: header(16) + ns_idx(4) + name_idx(4) + ...
             if (pos + 28 > size) break;
 
             uint32_t name_idx = read_u32(data + pos + 20);
@@ -256,163 +330,415 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
             const char *tag_name = (name_idx < axml->string_count) ?
                                     axml->strings[name_idx] : "";
 
+            // --- Parse attributes into temp storage ---
+            // For each attribute: ns(4) name(4) rawValue(4) typedValue(type:4 data:4) = 20 bytes
+            uint32_t attr_start = pos + 36;
+
             if (strcmp(tag_name, "manifest") == 0) {
-                // Look for package attribute
-                uint32_t attr_start = pos + 36;
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
-                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
-                    uint32_t attr_type = read_u32(data + aoff + 12) >> 24;
-                    uint32_t attr_data = read_u32(data + aoff + 16);
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
 
-                    if (attr_name_idx < axml->string_count &&
-                        strcmp(axml->strings[attr_name_idx], "package") == 0 &&
-                        attr_type == ATTR_TYPE_STRING &&
-                        attr_data < axml->string_count) {
-                        manifest->package_name = dx_strdup(axml->strings[attr_data]);
+                    if (ani < axml->string_count &&
+                        strcmp(axml->strings[ani], "package") == 0 &&
+                        atype == ATTR_TYPE_STRING &&
+                        adata < axml->string_count) {
+                        manifest->package_name = dx_strdup(axml->strings[adata]);
                         DX_INFO(TAG, "Package: %s", manifest->package_name);
                     }
                 }
             } else if (strcmp(tag_name, "uses-sdk") == 0) {
-                // Extract minSdkVersion and targetSdkVersion
-                uint32_t attr_start = pos + 36;
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
-                    uint32_t attr_res_id = read_u32(data + aoff + 4);
-                    // Check resource ID map if available
-                    if (attr_res_id < axml->string_count && axml->res_id_count > attr_res_id) {
-                        attr_res_id = axml->res_ids[attr_res_id];
-                    }
-                    uint32_t attr_data = read_u32(data + aoff + 16);
-                    if (attr_res_id == ATTR_MIN_SDK) {
-                        manifest->min_sdk = (int32_t)attr_data;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t rid = resolve_res_id(axml, ani);
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (rid == ATTR_MIN_SDK) {
+                        manifest->min_sdk = (int32_t)adata;
                         DX_INFO(TAG, "minSdkVersion: %d", manifest->min_sdk);
-                    } else if (attr_res_id == ATTR_TARGET_SDK) {
-                        manifest->target_sdk = (int32_t)attr_data;
+                    } else if (rid == ATTR_TARGET_SDK) {
+                        manifest->target_sdk = (int32_t)adata;
                         DX_INFO(TAG, "targetSdkVersion: %d", manifest->target_sdk);
                     }
                 }
             } else if (strcmp(tag_name, "uses-permission") == 0) {
-                char *perm_name = NULL;
-                EXTRACT_NAME_ATTR(perm_name);
-                if (perm_name) {
-                    append_string(&manifest->permissions, &manifest->permission_count, perm_name);
-                    dx_free(perm_name);
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (attr_is(axml, ani, ATTR_NAME, "name") &&
+                        atype == ATTR_TYPE_STRING && adata < axml->string_count) {
+                        append_string(&manifest->permissions, &manifest->permission_count,
+                                      axml->strings[adata]);
+                    }
+                }
+            } else if (strcmp(tag_name, "uses-feature") == 0) {
+                // Parse uses-feature
+                char *feat_name = NULL;
+                bool feat_required = true; // default per Android docs
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                        dx_free(feat_name);
+                        feat_name = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_REQUIRED, "required")) {
+                        if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
+                            feat_required = (adata != 0);
+                    }
+                }
+                if (feat_name) {
+                    uint32_t n = manifest->feature_count;
+                    DxUsesFeature *new_arr = (DxUsesFeature *)dx_realloc(
+                        manifest->features, sizeof(DxUsesFeature) * (n + 1));
+                    if (new_arr) {
+                        new_arr[n].name = feat_name;
+                        new_arr[n].required = feat_required;
+                        manifest->features = new_arr;
+                        manifest->feature_count = n + 1;
+                        DX_DEBUG(TAG, "uses-feature: %s (required=%d)", feat_name, feat_required);
+                    } else {
+                        dx_free(feat_name);
+                    }
+                }
+            } else if (strcmp(tag_name, "uses-library") == 0) {
+                char *lib_name = NULL;
+                bool lib_required = true;
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                        dx_free(lib_name);
+                        lib_name = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_REQUIRED, "required")) {
+                        if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
+                            lib_required = (adata != 0);
+                    }
+                }
+                if (lib_name) {
+                    uint32_t n = manifest->library_count;
+                    DxUsesLibrary *new_arr = (DxUsesLibrary *)dx_realloc(
+                        manifest->libraries, sizeof(DxUsesLibrary) * (n + 1));
+                    if (new_arr) {
+                        new_arr[n].name = lib_name;
+                        new_arr[n].required = lib_required;
+                        manifest->libraries = new_arr;
+                        manifest->library_count = n + 1;
+                        DX_DEBUG(TAG, "uses-library: %s (required=%d)", lib_name, lib_required);
+                    } else {
+                        dx_free(lib_name);
+                    }
                 }
             } else if (strcmp(tag_name, "application") == 0) {
-                // Extract android:label
-                uint32_t attr_start_app = pos + 36;
+                in_application = true;
+                current_comp_type = COMP_APPLICATION;
+                // Extract android:label and android:theme
                 for (uint16_t a = 0; a < attr_count; a++) {
-                    uint32_t aoff = attr_start_app + a * 20;
+                    uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
-                    uint32_t attr_res_id = read_u32(data + aoff + 4);
-                    if (attr_res_id < axml->string_count && axml->res_id_count > attr_res_id) {
-                        attr_res_id = axml->res_ids[attr_res_id];
-                    }
-                    uint32_t attr_type = read_u32(data + aoff + 12) >> 24;
-                    uint32_t attr_data = read_u32(data + aoff + 16);
-                    if (attr_res_id == ATTR_LABEL && attr_type == ATTR_TYPE_STRING &&
-                        attr_data < axml->string_count && !manifest->app_label) {
-                        manifest->app_label = dx_strdup(axml->strings[attr_data]);
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t rid = resolve_res_id(axml, ani);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (rid == ATTR_LABEL && atype == ATTR_TYPE_STRING &&
+                        adata < axml->string_count && !manifest->app_label) {
+                        manifest->app_label = dx_strdup(axml->strings[adata]);
                         DX_INFO(TAG, "App label: %s", manifest->app_label);
                     }
-                    // Extract android:theme (resource reference)
-                    if (attr_res_id == ATTR_THEME && !manifest->app_theme) {
-                        if (attr_type == ATTR_TYPE_STRING && attr_data < axml->string_count) {
-                            manifest->app_theme = dx_strdup(axml->strings[attr_data]);
+                    if (rid == ATTR_THEME && !manifest->app_theme) {
+                        if (atype == ATTR_TYPE_STRING && adata < axml->string_count) {
+                            manifest->app_theme = dx_strdup(axml->strings[adata]);
                         } else {
-                            // Theme is typically a resource reference (0x01 type)
                             char theme_ref[32];
-                            snprintf(theme_ref, sizeof(theme_ref), "@0x%08x", attr_data);
+                            snprintf(theme_ref, sizeof(theme_ref), "@0x%08x", adata);
                             manifest->app_theme = dx_strdup(theme_ref);
                         }
                         DX_INFO(TAG, "App theme: %s", manifest->app_theme);
                     }
                 }
-            } else if (strcmp(tag_name, "activity") == 0) {
-                in_activity = true;
-                found_main = false;
-                found_launcher = false;
-                dx_free(current_activity_name);
-                current_activity_name = NULL;
-                EXTRACT_NAME_ATTR(current_activity_name);
+            } else if (strcmp(tag_name, "activity") == 0 ||
+                       strcmp(tag_name, "activity-alias") == 0) {
+                // Parse activity component
+                char *comp_name = NULL;
+                bool exported = false;
+                bool exported_set = false;
 
-                // Add to activities list
-                if (current_activity_name) {
-                    // Resolve relative name for the list
-                    if (current_activity_name[0] == '.' && manifest->package_name) {
-                        size_t pkg_len = strlen(manifest->package_name);
-                        size_t act_len = strlen(current_activity_name);
-                        char *full = (char *)dx_malloc(pkg_len + act_len + 1);
-                        if (full) {
-                            memcpy(full, manifest->package_name, pkg_len);
-                            memcpy(full + pkg_len, current_activity_name, act_len + 1);
-                            append_string(&manifest->activities, &manifest->activity_count, full);
-                            dx_free(full);
-                        }
-                    } else {
-                        append_string(&manifest->activities, &manifest->activity_count, current_activity_name);
-                    }
-                }
-            } else if (strcmp(tag_name, "service") == 0) {
-                char *svc_name = NULL;
-                EXTRACT_NAME_ATTR(svc_name);
-                if (svc_name) {
-                    append_string(&manifest->services, &manifest->service_count, svc_name);
-                    dx_free(svc_name);
-                }
-            } else if (strcmp(tag_name, "receiver") == 0) {
-                char *rcv_name = NULL;
-                EXTRACT_NAME_ATTR(rcv_name);
-                if (rcv_name) {
-                    append_string(&manifest->receivers, &manifest->receiver_count, rcv_name);
-                    dx_free(rcv_name);
-                }
-            } else if (strcmp(tag_name, "provider") == 0) {
-                char *prv_name = NULL;
-                EXTRACT_NAME_ATTR(prv_name);
-                if (prv_name) {
-                    append_string(&manifest->providers, &manifest->provider_count, prv_name);
-                    dx_free(prv_name);
-                }
-            } else if (strcmp(tag_name, "intent-filter") == 0) {
-                in_intent_filter = true;
-            } else if (strcmp(tag_name, "action") == 0 && in_intent_filter) {
-                uint32_t attr_start = pos + 36;
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
-                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
-                    uint32_t attr_type = read_u32(data + aoff + 12) >> 24;
-                    uint32_t attr_data = read_u32(data + aoff + 16);
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                        dx_free(comp_name);
+                        comp_name = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_EXPORTED, "exported")) {
+                        exported_set = true;
+                        if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
+                            exported = (adata != 0);
+                    }
+                }
 
-                    if (attr_name_idx < axml->string_count &&
-                        strcmp(axml->strings[attr_name_idx], "name") == 0 &&
-                        attr_type == ATTR_TYPE_STRING &&
-                        attr_data < axml->string_count &&
-                        strcmp(axml->strings[attr_data], "android.intent.action.MAIN") == 0) {
-                        found_main = true;
+                char *resolved = resolve_class_name(comp_name, manifest->package_name);
+                if (resolved) {
+                    append_string(&manifest->activities, &manifest->activity_count, resolved);
+                }
+
+                current_comp = append_component(&manifest->activity_components,
+                                                 &manifest->activity_component_count);
+                if (current_comp) {
+                    current_comp->name = resolved ? dx_strdup(resolved) : NULL;
+                    current_comp->exported = exported;
+                    current_comp->exported_set = exported_set;
+                }
+                current_comp_type = COMP_ACTIVITY;
+
+                // Track for MAIN/LAUNCHER detection
+                dx_free(current_activity_name);
+                current_activity_name = resolved; // take ownership
+                found_main = false;
+                found_launcher = false;
+                dx_free(comp_name);
+            } else if (strcmp(tag_name, "service") == 0) {
+                char *comp_name = NULL;
+                bool exported = false;
+                bool exported_set = false;
+
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                        dx_free(comp_name);
+                        comp_name = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_EXPORTED, "exported")) {
+                        exported_set = true;
+                        if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
+                            exported = (adata != 0);
+                    }
+                }
+
+                char *resolved = resolve_class_name(comp_name, manifest->package_name);
+                if (resolved) {
+                    append_string(&manifest->services, &manifest->service_count, resolved);
+                }
+
+                current_comp = append_component(&manifest->service_components,
+                                                 &manifest->service_component_count);
+                if (current_comp) {
+                    current_comp->name = resolved ? dx_strdup(resolved) : NULL;
+                    current_comp->exported = exported;
+                    current_comp->exported_set = exported_set;
+                }
+                current_comp_type = COMP_SERVICE;
+                dx_free(resolved);
+                dx_free(comp_name);
+            } else if (strcmp(tag_name, "receiver") == 0) {
+                char *comp_name = NULL;
+                bool exported = false;
+                bool exported_set = false;
+
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                        dx_free(comp_name);
+                        comp_name = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_EXPORTED, "exported")) {
+                        exported_set = true;
+                        if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
+                            exported = (adata != 0);
+                    }
+                }
+
+                char *resolved = resolve_class_name(comp_name, manifest->package_name);
+                if (resolved) {
+                    append_string(&manifest->receivers, &manifest->receiver_count, resolved);
+                }
+
+                current_comp = append_component(&manifest->receiver_components,
+                                                 &manifest->receiver_component_count);
+                if (current_comp) {
+                    current_comp->name = resolved ? dx_strdup(resolved) : NULL;
+                    current_comp->exported = exported;
+                    current_comp->exported_set = exported_set;
+                }
+                current_comp_type = COMP_RECEIVER;
+                dx_free(resolved);
+                dx_free(comp_name);
+            } else if (strcmp(tag_name, "provider") == 0) {
+                char *comp_name = NULL;
+                bool exported = false;
+                bool exported_set = false;
+
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                        dx_free(comp_name);
+                        comp_name = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_EXPORTED, "exported")) {
+                        exported_set = true;
+                        if (atype == ATTR_TYPE_INT_BOOL || atype == ATTR_TYPE_INT_DEC)
+                            exported = (adata != 0);
+                    }
+                }
+
+                char *resolved = resolve_class_name(comp_name, manifest->package_name);
+                if (resolved) {
+                    append_string(&manifest->providers, &manifest->provider_count, resolved);
+                }
+
+                current_comp = append_component(&manifest->provider_components,
+                                                 &manifest->provider_component_count);
+                if (current_comp) {
+                    current_comp->name = resolved ? dx_strdup(resolved) : NULL;
+                    current_comp->exported = exported;
+                    current_comp->exported_set = exported_set;
+                }
+                current_comp_type = COMP_PROVIDER;
+                dx_free(resolved);
+                dx_free(comp_name);
+            } else if (strcmp(tag_name, "intent-filter") == 0) {
+                in_intent_filter = true;
+                memset(&current_filter, 0, sizeof(current_filter));
+            } else if (strcmp(tag_name, "action") == 0 && in_intent_filter) {
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+
+                    if (attr_is(axml, ani, ATTR_NAME, "name") &&
+                        atype == ATTR_TYPE_STRING && adata < axml->string_count) {
+                        const char *action = axml->strings[adata];
+                        append_string(&current_filter.actions, &current_filter.action_count, action);
+                        if (strcmp(action, "android.intent.action.MAIN") == 0)
+                            found_main = true;
                     }
                 }
             } else if (strcmp(tag_name, "category") == 0 && in_intent_filter) {
-                uint32_t attr_start = pos + 36;
                 for (uint16_t a = 0; a < attr_count; a++) {
                     uint32_t aoff = attr_start + a * 20;
                     if (aoff + 20 > size) break;
-                    uint32_t attr_name_idx = read_u32(data + aoff + 4);
-                    uint32_t attr_type = read_u32(data + aoff + 12) >> 24;
-                    uint32_t attr_data = read_u32(data + aoff + 16);
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
 
-                    if (attr_name_idx < axml->string_count &&
-                        strcmp(axml->strings[attr_name_idx], "name") == 0 &&
-                        attr_type == ATTR_TYPE_STRING &&
-                        attr_data < axml->string_count &&
-                        strcmp(axml->strings[attr_data], "android.intent.category.LAUNCHER") == 0) {
-                        found_launcher = true;
+                    if (attr_is(axml, ani, ATTR_NAME, "name") &&
+                        atype == ATTR_TYPE_STRING && adata < axml->string_count) {
+                        const char *cat = axml->strings[adata];
+                        append_string(&current_filter.categories, &current_filter.category_count, cat);
+                        if (strcmp(cat, "android.intent.category.LAUNCHER") == 0)
+                            found_launcher = true;
                     }
                 }
+            } else if (strcmp(tag_name, "data") == 0 && in_intent_filter) {
+                // Parse <data> element attributes
+                DxIntentData d;
+                memset(&d, 0, sizeof(d));
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+
+                    if (attr_is(axml, ani, ATTR_SCHEME, "scheme")) {
+                        d.scheme = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_HOST, "host")) {
+                        d.host = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_PATH, "path")) {
+                        d.path = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_PATH_PREFIX, "pathPrefix")) {
+                        d.path_prefix = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_PATH_PATTERN, "pathPattern")) {
+                        d.path_pattern = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_MIME_TYPE, "mimeType")) {
+                        d.mime_type = attr_string(axml, atype, adata);
+                    }
+                }
+                // Only add if at least one field was set
+                if (d.scheme || d.host || d.path || d.path_prefix || d.path_pattern || d.mime_type) {
+                    append_intent_data(&current_filter, &d);
+                } else {
+                    // free any partial allocations (all NULL here, but be safe)
+                    dx_free(d.scheme); dx_free(d.host); dx_free(d.path);
+                    dx_free(d.path_prefix); dx_free(d.path_pattern); dx_free(d.mime_type);
+                }
+            } else if (strcmp(tag_name, "meta-data") == 0) {
+                // Parse <meta-data> android:name and android:value
+                char *md_name = NULL;
+                char *md_value = NULL;
+                for (uint16_t a = 0; a < attr_count; a++) {
+                    uint32_t aoff = attr_start + a * 20;
+                    if (aoff + 20 > size) break;
+                    uint32_t ani = read_u32(data + aoff + 4);
+                    uint32_t atype = read_u32(data + aoff + 12) >> 24;
+                    uint32_t adata = read_u32(data + aoff + 16);
+
+                    if (attr_is(axml, ani, ATTR_NAME, "name")) {
+                        dx_free(md_name);
+                        md_name = attr_string(axml, atype, adata);
+                    } else if (attr_is(axml, ani, ATTR_VALUE, "value")) {
+                        dx_free(md_value);
+                        if (atype == ATTR_TYPE_STRING && adata < axml->string_count) {
+                            md_value = dx_strdup(axml->strings[adata]);
+                        } else if (atype == ATTR_TYPE_INT_DEC) {
+                            char buf[32];
+                            snprintf(buf, sizeof(buf), "%d", (int32_t)adata);
+                            md_value = dx_strdup(buf);
+                        } else if (atype == ATTR_TYPE_INT_HEX || atype == ATTR_TYPE_REFERENCE) {
+                            char buf[32];
+                            snprintf(buf, sizeof(buf), "@0x%08x", adata);
+                            md_value = dx_strdup(buf);
+                        } else if (atype == ATTR_TYPE_INT_BOOL) {
+                            md_value = dx_strdup(adata ? "true" : "false");
+                        }
+                    } else if (attr_is(axml, ani, ATTR_RESOURCE, "resource")) {
+                        // android:resource is an alternative to android:value
+                        if (!md_value) {
+                            char buf[32];
+                            snprintf(buf, sizeof(buf), "@0x%08x", adata);
+                            md_value = dx_strdup(buf);
+                        }
+                    }
+                }
+                if (md_name) {
+                    // Attach to current component or application
+                    if (current_comp && current_comp_type != COMP_APPLICATION &&
+                        current_comp_type != COMP_NONE) {
+                        append_meta_data(&current_comp->meta_data, &current_comp->meta_data_count,
+                                         md_name, md_value);
+                    } else if (in_application) {
+                        append_meta_data(&manifest->app_meta_data, &manifest->app_meta_data_count,
+                                         md_name, md_value);
+                    }
+                    DX_DEBUG(TAG, "meta-data: %s = %s", md_name, md_value ? md_value : "(null)");
+                }
+                dx_free(md_name);
+                dx_free(md_value);
             }
         } else if (chunk_type == AXML_CHUNK_END_TAG) {
             uint32_t name_idx = read_u32(data + pos + 20);
@@ -420,32 +746,61 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
                                     axml->strings[name_idx] : "";
 
             if (strcmp(tag_name, "intent-filter") == 0) {
-                if (found_main && found_launcher && current_activity_name) {
-                    // Resolve relative activity name
-                    if (current_activity_name[0] == '.' && manifest->package_name) {
-                        size_t pkg_len = strlen(manifest->package_name);
-                        size_t act_len = strlen(current_activity_name);
-                        char *full = (char *)dx_malloc(pkg_len + act_len + 1);
-                        if (full) {
-                            memcpy(full, manifest->package_name, pkg_len);
-                            memcpy(full + pkg_len, current_activity_name, act_len + 1);
-                            manifest->main_activity = full;
-                        }
-                    } else {
-                        manifest->main_activity = dx_strdup(current_activity_name);
-                    }
+                // Check for main/launcher
+                if (found_main && found_launcher && current_activity_name &&
+                    !manifest->main_activity) {
+                    manifest->main_activity = dx_strdup(current_activity_name);
                     DX_INFO(TAG, "Main activity: %s", manifest->main_activity);
                 }
+
+                // Store intent filter on current component
+                if (current_comp && current_comp_type != COMP_APPLICATION &&
+                    current_comp_type != COMP_NONE) {
+                    append_intent_filter(current_comp, &current_filter);
+                } else {
+                    // Free orphan filter data
+                    for (uint32_t i = 0; i < current_filter.action_count; i++)
+                        dx_free(current_filter.actions[i]);
+                    dx_free(current_filter.actions);
+                    for (uint32_t i = 0; i < current_filter.category_count; i++)
+                        dx_free(current_filter.categories[i]);
+                    dx_free(current_filter.categories);
+                    for (uint32_t i = 0; i < current_filter.data_count; i++) {
+                        dx_free(current_filter.data_entries[i].scheme);
+                        dx_free(current_filter.data_entries[i].host);
+                        dx_free(current_filter.data_entries[i].path);
+                        dx_free(current_filter.data_entries[i].path_prefix);
+                        dx_free(current_filter.data_entries[i].path_pattern);
+                        dx_free(current_filter.data_entries[i].mime_type);
+                    }
+                    dx_free(current_filter.data_entries);
+                }
+                memset(&current_filter, 0, sizeof(current_filter));
                 in_intent_filter = false;
-            } else if (strcmp(tag_name, "activity") == 0) {
-                in_activity = false;
+            } else if (strcmp(tag_name, "activity") == 0 ||
+                       strcmp(tag_name, "activity-alias") == 0) {
+                current_comp_type = in_application ? COMP_APPLICATION : COMP_NONE;
+                current_comp = NULL;
+                found_main = false;
+                found_launcher = false;
+            } else if (strcmp(tag_name, "service") == 0) {
+                current_comp_type = in_application ? COMP_APPLICATION : COMP_NONE;
+                current_comp = NULL;
+            } else if (strcmp(tag_name, "receiver") == 0) {
+                current_comp_type = in_application ? COMP_APPLICATION : COMP_NONE;
+                current_comp = NULL;
+            } else if (strcmp(tag_name, "provider") == 0) {
+                current_comp_type = in_application ? COMP_APPLICATION : COMP_NONE;
+                current_comp = NULL;
+            } else if (strcmp(tag_name, "application") == 0) {
+                in_application = false;
+                current_comp_type = COMP_NONE;
+                current_comp = NULL;
             }
         }
 
         pos += chunk_size;
     }
-
-    #undef EXTRACT_NAME_ATTR
 
     dx_free(current_activity_name);
     dx_axml_free(axml);
@@ -457,16 +812,60 @@ DxResult dx_manifest_parse(const uint8_t *data, uint32_t size, DxManifest **out)
     DX_INFO(TAG, "Manifest: %u permissions, %u activities, %u services, %u receivers, %u providers",
             manifest->permission_count, manifest->activity_count,
             manifest->service_count, manifest->receiver_count, manifest->provider_count);
+    DX_INFO(TAG, "Manifest: %u features, %u libraries, %u app meta-data",
+            manifest->feature_count, manifest->library_count, manifest->app_meta_data_count);
 
     *out = manifest;
     return DX_OK;
 }
 
+// ---- Free helpers ----
 static void free_string_array(char **arr, uint32_t count) {
     if (!arr) return;
     for (uint32_t i = 0; i < count; i++) {
         dx_free(arr[i]);
     }
+    dx_free(arr);
+}
+
+static void free_intent_data(DxIntentData *d) {
+    dx_free(d->scheme);
+    dx_free(d->host);
+    dx_free(d->path);
+    dx_free(d->path_prefix);
+    dx_free(d->path_pattern);
+    dx_free(d->mime_type);
+}
+
+static void free_intent_filter(DxIntentFilter *f) {
+    free_string_array(f->actions, f->action_count);
+    free_string_array(f->categories, f->category_count);
+    for (uint32_t i = 0; i < f->data_count; i++)
+        free_intent_data(&f->data_entries[i]);
+    dx_free(f->data_entries);
+}
+
+static void free_meta_data_array(DxMetaData *arr, uint32_t count) {
+    if (!arr) return;
+    for (uint32_t i = 0; i < count; i++) {
+        dx_free(arr[i].name);
+        dx_free(arr[i].value);
+    }
+    dx_free(arr);
+}
+
+static void free_component(DxComponent *c) {
+    dx_free(c->name);
+    for (uint32_t i = 0; i < c->intent_filter_count; i++)
+        free_intent_filter(&c->intent_filters[i]);
+    dx_free(c->intent_filters);
+    free_meta_data_array(c->meta_data, c->meta_data_count);
+}
+
+static void free_component_array(DxComponent *arr, uint32_t count) {
+    if (!arr) return;
+    for (uint32_t i = 0; i < count; i++)
+        free_component(&arr[i]);
     dx_free(arr);
 }
 
@@ -481,5 +880,52 @@ void dx_manifest_free(DxManifest *manifest) {
     free_string_array(manifest->services, manifest->service_count);
     free_string_array(manifest->receivers, manifest->receiver_count);
     free_string_array(manifest->providers, manifest->provider_count);
+
+    free_component_array(manifest->activity_components, manifest->activity_component_count);
+    free_component_array(manifest->service_components, manifest->service_component_count);
+    free_component_array(manifest->receiver_components, manifest->receiver_component_count);
+    free_component_array(manifest->provider_components, manifest->provider_component_count);
+
+    free_meta_data_array(manifest->app_meta_data, manifest->app_meta_data_count);
+
+    for (uint32_t i = 0; i < manifest->feature_count; i++)
+        dx_free(manifest->features[i].name);
+    dx_free(manifest->features);
+
+    for (uint32_t i = 0; i < manifest->library_count; i++)
+        dx_free(manifest->libraries[i].name);
+    dx_free(manifest->libraries);
+
     dx_free(manifest);
+}
+
+// ---- Lookup helpers ----
+const DxComponent *dx_manifest_find_activity(const DxManifest *m, const char *name) {
+    if (!m || !name) return NULL;
+    for (uint32_t i = 0; i < m->activity_component_count; i++) {
+        if (m->activity_components[i].name &&
+            strcmp(m->activity_components[i].name, name) == 0)
+            return &m->activity_components[i];
+    }
+    return NULL;
+}
+
+const DxComponent *dx_manifest_find_service(const DxManifest *m, const char *name) {
+    if (!m || !name) return NULL;
+    for (uint32_t i = 0; i < m->service_component_count; i++) {
+        if (m->service_components[i].name &&
+            strcmp(m->service_components[i].name, name) == 0)
+            return &m->service_components[i];
+    }
+    return NULL;
+}
+
+const DxComponent *dx_manifest_find_receiver(const DxManifest *m, const char *name) {
+    if (!m || !name) return NULL;
+    for (uint32_t i = 0; i < m->receiver_component_count; i++) {
+        if (m->receiver_components[i].name &&
+            strcmp(m->receiver_components[i].name, name) == 0)
+            return &m->receiver_components[i];
+    }
+    return NULL;
 }

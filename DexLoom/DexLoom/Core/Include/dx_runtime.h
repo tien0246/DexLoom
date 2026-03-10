@@ -18,6 +18,12 @@ DxResult dx_runtime_run(DxContext *ctx);
 // Dispatch a UI event (button click)
 DxResult dx_runtime_dispatch_click(DxContext *ctx, uint32_t view_id);
 
+// Dispatch a long-click event
+DxResult dx_runtime_dispatch_long_click(DxContext *ctx, uint32_t view_id);
+
+// Dispatch a pull-to-refresh event (SwipeRefreshLayout)
+DxResult dx_runtime_dispatch_refresh(DxContext *ctx, uint32_t view_id);
+
 // Update EditText content from Swift UI input
 DxResult dx_runtime_update_edit_text(DxContext *ctx, uint32_t view_id, const char *text);
 

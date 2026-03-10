@@ -16,6 +16,25 @@
 #define DX_REL_LEFT_OF               0x0200
 #define DX_REL_RIGHT_OF              0x0400
 
+// ConstraintLayout constraint target sentinel values
+// 0 means "no constraint", 0xFFFFFFFF means "parent"
+#define DX_CONSTRAINT_NONE   0
+#define DX_CONSTRAINT_PARENT 0xFFFFFFFF
+
+// ConstraintLayout constraint anchors stored per child node
+typedef struct DxConstraints {
+    uint32_t left_to_left;     // view ID or DX_CONSTRAINT_PARENT
+    uint32_t left_to_right;    // view ID or DX_CONSTRAINT_PARENT
+    uint32_t right_to_right;   // view ID or DX_CONSTRAINT_PARENT
+    uint32_t right_to_left;    // view ID or DX_CONSTRAINT_PARENT
+    uint32_t top_to_top;       // view ID or DX_CONSTRAINT_PARENT
+    uint32_t top_to_bottom;    // view ID or DX_CONSTRAINT_PARENT
+    uint32_t bottom_to_bottom; // view ID or DX_CONSTRAINT_PARENT
+    uint32_t bottom_to_top;    // view ID or DX_CONSTRAINT_PARENT
+    float    horizontal_bias;  // 0.0-1.0, default 0.5
+    float    vertical_bias;    // 0.0-1.0, default 0.5
+} DxConstraints;
+
 // UI tree node - represents an Android View in the internal UI tree
 struct DxUINode {
     DxViewType   type;
@@ -47,12 +66,24 @@ struct DxUINode {
     uint32_t      rel_left_of;     // layout_toLeftOf: view ID
     uint32_t      rel_right_of;    // layout_toRightOf: view ID
 
+    // ConstraintLayout constraints
+    DxConstraints constraints;
+
     // Image data (for ImageView - extracted from APK drawable resources)
     uint8_t     *image_data;       // PNG/JPEG bytes (owned, freed on destroy)
     uint32_t     image_data_len;   // length of image_data
 
     // Click listener (reference to DxObject implementing OnClickListener)
     DxObject    *click_listener;
+
+    // Long-click listener (reference to DxObject implementing OnLongClickListener)
+    DxObject    *long_click_listener;
+
+    // Touch listener (reference to DxObject implementing OnTouchListener)
+    DxObject    *touch_listener;
+
+    // Refresh listener (for SwipeRefreshLayout, implementing OnRefreshListener)
+    DxObject    *refresh_listener;
 
     // Back-reference to runtime object
     DxObject    *runtime_obj;
@@ -83,11 +114,16 @@ typedef struct DxRenderNode {
     uint32_t      text_color;
     bool          is_checked;
     bool          has_click_listener;
+    bool          has_long_click_listener;
+    bool          has_refresh_listener;
     uint16_t      relative_flags;
     uint32_t      rel_above;
     uint32_t      rel_below;
     uint32_t      rel_left_of;
     uint32_t      rel_right_of;
+
+    // ConstraintLayout constraints
+    DxConstraints constraints;
 
     // Image data (for ImageView)
     const uint8_t *image_data;     // PNG/JPEG bytes (NOT owned - points into DxUINode data)

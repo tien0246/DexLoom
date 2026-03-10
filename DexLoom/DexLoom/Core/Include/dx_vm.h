@@ -177,6 +177,7 @@ struct DxVM {
         DxObject *activity;     // the Activity object
         DxObject *intent;       // Intent that launched it
         int32_t   request_code; // -1 if plain startActivity
+        DxObject *saved_state;  // Bundle from onSaveInstanceState (NULL if none)
     } activity_stack[DX_MAX_ACTIVITY_STACK];
     uint32_t activity_stack_depth;
 

@@ -1,6 +1,7 @@
 #include "../Include/dx_vm.h"
 #include "../Include/dx_view.h"
 #include "../Include/dx_context.h"
+#include "../Include/dx_apk.h"
 #include "../Include/dx_log.h"
 #include "../Include/dx_resources.h"
 #include <string.h>
@@ -14,6 +15,8 @@
 
 // Forward declarations
 static void rebuild_render_model(DxVM *vm);
+static DxObject *create_file_object(DxVM *vm, const char *path);
+static DxObject *call_on_save_instance_state(DxVM *vm, DxObject *activity);
 extern DxResult dx_register_java_lang(DxVM *vm);
 
 // Reflection native method forward declarations
@@ -1888,9 +1891,13 @@ static DxResult start_activity_internal(DxVM *vm, DxObject *caller, DxObject *in
     // --- Push the current activity onto the back-stack ---
     DxObject *prev_activity = vm->activity_instance;
     if (prev_activity && vm->activity_stack_depth < DX_MAX_ACTIVITY_STACK) {
+        // Call onSaveInstanceState before pausing
+        DxObject *saved = call_on_save_instance_state(vm, prev_activity);
+
         vm->activity_stack[vm->activity_stack_depth].activity     = prev_activity;
         vm->activity_stack[vm->activity_stack_depth].intent       = intent;
         vm->activity_stack[vm->activity_stack_depth].request_code = request_code;
+        vm->activity_stack[vm->activity_stack_depth].saved_state  = saved;
         vm->activity_stack_depth++;
 
         // Call onPause() on the previous activity
@@ -2173,6 +2180,174 @@ static DxResult native_activity_finish(DxVM *vm, DxFrame *frame, DxValue *args, 
 }
 
 // ============================================================
+// Activity.onSaveInstanceState(Bundle) -- base impl is a no-op
+// ============================================================
+static DxResult native_activity_on_save_instance_state(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame; (void)args; (void)arg_count;
+    // Base Activity.onSaveInstanceState does nothing.
+    // App subclass overrides this and the interpreter dispatches to the override.
+    return DX_OK;
+}
+
+// ============================================================
+// Activity.onRestoreInstanceState(Bundle) -- base impl is a no-op
+// ============================================================
+static DxResult native_activity_on_restore_instance_state(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame; (void)args; (void)arg_count;
+    return DX_OK;
+}
+
+// ============================================================
+// Activity.onConfigurationChanged(Configuration) -- base impl is a no-op
+// ============================================================
+static DxResult native_activity_on_config_changed(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame; (void)args; (void)arg_count;
+    return DX_OK;
+}
+
+// ============================================================
+// Helper: call onSaveInstanceState on an activity, return the saved Bundle
+// ============================================================
+static DxObject *call_on_save_instance_state(DxVM *vm, DxObject *activity) {
+    if (!activity || !activity->klass) return NULL;
+
+    DxMethod *save = dx_vm_find_method(activity->klass, "onSaveInstanceState", NULL);
+    if (!save) return NULL;
+
+    // Create a fresh Bundle for the activity to save into
+    DxObject *bundle = dx_vm_alloc_object(vm, vm->class_bundle);
+    if (!bundle) return NULL;
+
+    DX_INFO(TAG, "Calling onSaveInstanceState on %s", activity->klass->descriptor);
+    vm->insn_count = 0;
+    vm->pending_exception = NULL;
+    DxValue save_args[2] = { DX_OBJ_VALUE(activity), DX_OBJ_VALUE(bundle) };
+    DxResult res = dx_vm_execute_method(vm, save, save_args, 2, NULL);
+    if (res == DX_ERR_EXCEPTION) {
+        DX_WARN(TAG, "onSaveInstanceState threw %s (absorbed)",
+                vm->pending_exception && vm->pending_exception->klass
+                ? vm->pending_exception->klass->descriptor : "unknown");
+        vm->pending_exception = NULL;
+    }
+    return bundle;
+}
+
+// ============================================================
+// Helper: call onRestoreInstanceState on an activity with a saved Bundle
+// ============================================================
+static void call_on_restore_instance_state(DxVM *vm, DxObject *activity, DxObject *bundle) {
+    if (!activity || !activity->klass || !bundle) return;
+
+    DxMethod *restore = dx_vm_find_method(activity->klass, "onRestoreInstanceState", NULL);
+    if (!restore) return;
+
+    DX_INFO(TAG, "Calling onRestoreInstanceState on %s", activity->klass->descriptor);
+    vm->insn_count = 0;
+    vm->pending_exception = NULL;
+    DxValue args[2] = { DX_OBJ_VALUE(activity), DX_OBJ_VALUE(bundle) };
+    DxResult res = dx_vm_execute_method(vm, restore, args, 2, NULL);
+    if (res == DX_ERR_EXCEPTION) {
+        DX_WARN(TAG, "onRestoreInstanceState threw %s (absorbed)",
+                vm->pending_exception && vm->pending_exception->klass
+                ? vm->pending_exception->klass->descriptor : "unknown");
+        vm->pending_exception = NULL;
+    }
+}
+
+// ============================================================
+// Activity.recreate() -- save state, destroy, recreate with saved Bundle
+// ============================================================
+static DxResult native_activity_recreate(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)frame; (void)arg_count;
+    DxObject *activity = (arg_count >= 1 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!activity || !activity->klass) return DX_OK;
+
+    const char *desc = activity->klass->descriptor;
+    DxClass *cls = activity->klass;
+    DX_INFO(TAG, "recreate: recreating %s", desc);
+
+    // 1. onSaveInstanceState
+    DxObject *saved_bundle = call_on_save_instance_state(vm, activity);
+
+    // 2. Lifecycle teardown: onPause -> onStop -> onDestroy
+    DxMethod *on_pause = dx_vm_find_method(cls, "onPause", "V");
+    if (on_pause) {
+        vm->insn_count = 0; vm->pending_exception = NULL;
+        DxValue a[1] = { DX_OBJ_VALUE(activity) };
+        dx_vm_execute_method(vm, on_pause, a, 1, NULL);
+        if (vm->pending_exception) vm->pending_exception = NULL;
+    }
+    DxMethod *on_stop = dx_vm_find_method(cls, "onStop", "V");
+    if (on_stop) {
+        vm->insn_count = 0; vm->pending_exception = NULL;
+        DxValue a[1] = { DX_OBJ_VALUE(activity) };
+        dx_vm_execute_method(vm, on_stop, a, 1, NULL);
+        if (vm->pending_exception) vm->pending_exception = NULL;
+    }
+    DxMethod *on_destroy = dx_vm_find_method(cls, "onDestroy", "V");
+    if (on_destroy) {
+        vm->insn_count = 0; vm->pending_exception = NULL;
+        DxValue a[1] = { DX_OBJ_VALUE(activity) };
+        dx_vm_execute_method(vm, on_destroy, a, 1, NULL);
+        if (vm->pending_exception) vm->pending_exception = NULL;
+    }
+
+    // 3. Create new instance
+    DxObject *new_activity = dx_vm_alloc_object(vm, cls);
+    if (!new_activity) return DX_OK;
+    vm->activity_instance = new_activity;
+
+    // 4. Call <init>
+    DxMethod *init = dx_vm_find_method(cls, "<init>", NULL);
+    if (init) {
+        vm->insn_count = 0; vm->pending_exception = NULL;
+        DxValue init_args[1] = { DX_OBJ_VALUE(new_activity) };
+        DxResult res = dx_vm_execute_method(vm, init, init_args, 1, NULL);
+        if (res == DX_ERR_EXCEPTION) { vm->pending_exception = NULL; }
+        else if (res == DX_ERR_STACK_OVERFLOW || res == DX_ERR_INTERNAL) {
+            return DX_OK;
+        }
+    }
+
+    // 5. onCreate(savedBundle)
+    DxMethod *on_create = dx_vm_find_method(cls, "onCreate", NULL);
+    if (on_create) {
+        vm->insn_count = 0; vm->pending_exception = NULL;
+        DxValue oc_args[2] = {
+            DX_OBJ_VALUE(new_activity),
+            saved_bundle ? DX_OBJ_VALUE(saved_bundle) : DX_NULL_VALUE
+        };
+        DxResult res = dx_vm_execute_method(vm, on_create, oc_args, 2, NULL);
+        if (res == DX_ERR_EXCEPTION) { vm->pending_exception = NULL; }
+    }
+
+    // 6. onRestoreInstanceState(savedBundle)
+    if (saved_bundle) {
+        call_on_restore_instance_state(vm, new_activity, saved_bundle);
+    }
+
+    // 7. onStart -> onResume
+    DxMethod *on_start = dx_vm_find_method(cls, "onStart", "V");
+    if (on_start) {
+        vm->insn_count = 0; vm->pending_exception = NULL;
+        DxValue a[1] = { DX_OBJ_VALUE(new_activity) };
+        dx_vm_execute_method(vm, on_start, a, 1, NULL);
+        if (vm->pending_exception) vm->pending_exception = NULL;
+    }
+    DxMethod *on_resume = dx_vm_find_method(cls, "onResume", "V");
+    if (on_resume) {
+        vm->insn_count = 0; vm->pending_exception = NULL;
+        DxValue a[1] = { DX_OBJ_VALUE(new_activity) };
+        dx_vm_execute_method(vm, on_resume, a, 1, NULL);
+        if (vm->pending_exception) vm->pending_exception = NULL;
+    }
+
+    DX_INFO(TAG, "recreate: %s recreated (lifecycle: onSaveInstanceState -> onDestroy -> onCreate -> onRestoreInstanceState -> onStart -> onResume)", desc);
+    rebuild_render_model(vm);
+    return DX_OK;
+}
+
+// ============================================================
 // Activity.getIntent() -- return the Intent that launched this activity
 // ============================================================
 static DxResult native_activity_get_intent(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
@@ -2273,6 +2448,22 @@ static DxResult native_return_true(DxVM *vm, DxFrame *frame, DxValue *args, uint
 static DxResult native_return_int_zero(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
     (void)vm; (void)args; (void)arg_count;
     frame->result = DX_INT_VALUE(0);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// Run Runnable arg[1] synchronously, return self (arg[0]) – for withStartAction/withEndAction
+static DxResult native_run_runnable_return_self(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    if (arg_count >= 2 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        DxObject *runnable = args[1].obj;
+        DxMethod *run_method = dx_vm_find_method(runnable->klass, "run", NULL);
+        if (run_method) {
+            DxValue run_args[1] = { DX_OBJ_VALUE(runnable) };
+            dx_vm_execute_method(vm, run_method, run_args, 1, NULL);
+            if (vm->pending_exception) vm->pending_exception = NULL;
+        }
+    }
+    frame->result = DX_OBJ_VALUE(args[0].obj);
     frame->has_result = true;
     return DX_OK;
 }
@@ -2577,6 +2768,21 @@ static DxResult native_return_int_1000(DxVM *vm, DxFrame *frame, DxValue *args, 
 static DxResult native_return_int_10000(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
     (void)vm; (void)args; (void)arg_count;
     frame->result = DX_INT_VALUE(10000);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_return_int_200(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)args; (void)arg_count;
+    frame->result = DX_INT_VALUE(200);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_return_empty_json_string(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    DxObject *s = dx_vm_create_string(vm, "{}");
+    frame->result = s ? DX_OBJ_VALUE(s) : DX_NULL_VALUE;
     frame->has_result = true;
     return DX_OK;
 }
@@ -3658,6 +3864,323 @@ static DxResult native_file_length(DxVM *vm, DxFrame *frame, DxValue *args, uint
 }
 
 // ============================================================
+// AssetManager.open — extract asset from APK and return InputStream
+// ============================================================
+
+// Helper: create a field-backed InputStream with data buffer
+static DxObject *create_input_stream_from_data(DxVM *vm, uint8_t *data, uint32_t size) {
+    DxClass *is_cls = dx_vm_find_class(vm, "Ljava/io/InputStream;");
+    if (!is_cls) return NULL;
+    DxObject *is_obj = dx_vm_alloc_object(vm, is_cls);
+    if (!is_obj) { free(data); return NULL; }
+    // Store pointer as long, size and position as int
+    dx_vm_set_field(is_obj, "_data", (DxValue){.tag = DX_VAL_LONG, .l = (int64_t)(uintptr_t)data});
+    dx_vm_set_field(is_obj, "_size", DX_INT_VALUE((int32_t)size));
+    dx_vm_set_field(is_obj, "_position", DX_INT_VALUE(0));
+    return is_obj;
+}
+
+static DxResult native_asset_manager_open(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    // args[0] = this (AssetManager), args[1] = filename string
+    const char *filename = NULL;
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        filename = dx_vm_get_string_value(args[1].obj);
+    }
+    if (!filename) {
+        DX_WARN("AssetManager", "open() called with null filename");
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DX_INFO("AssetManager", "open(\"%s\")", filename);
+
+    DxContext *ctx = vm->ctx;
+    if (!ctx || !ctx->apk) {
+        DX_WARN("AssetManager", "No APK loaded");
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    // Build "assets/{filename}" path
+    char asset_path[512];
+    snprintf(asset_path, sizeof(asset_path), "assets/%s", filename);
+
+    const DxZipEntry *entry = NULL;
+    DxResult res = dx_apk_find_entry(ctx->apk, asset_path, &entry);
+    if (res != DX_OK || !entry) {
+        DX_WARN("AssetManager", "Asset not found: %s", asset_path);
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    uint8_t *data = NULL;
+    uint32_t data_size = 0;
+    res = dx_apk_extract_entry(ctx->apk, entry, &data, &data_size);
+    if (res != DX_OK || !data) {
+        DX_WARN("AssetManager", "Failed to extract asset: %s", asset_path);
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DxObject *is_obj = create_input_stream_from_data(vm, data, data_size);
+    frame->result = is_obj ? DX_OBJ_VALUE(is_obj) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// AssetManager.list — return empty String[] for now
+static DxResult native_asset_manager_list(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    DxObject *arr = dx_vm_alloc_array(vm, 0);
+    frame->result = arr ? DX_OBJ_VALUE(arr) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// InputStream — field-backed read/available/close
+// ============================================================
+
+// InputStream.read() -> int  (next byte or -1 at EOF)
+static DxResult native_inputstream_read(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)arg_count;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DxValue data_val, size_val, pos_val;
+    if (dx_vm_get_field(self, "_data", &data_val) != DX_OK || data_val.tag != DX_VAL_LONG) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    dx_vm_get_field(self, "_size", &size_val);
+    dx_vm_get_field(self, "_position", &pos_val);
+
+    uint8_t *data = (uint8_t *)(uintptr_t)data_val.l;
+    int32_t size = size_val.i;
+    int32_t pos = pos_val.i;
+
+    if (!data || pos >= size) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    int32_t byte_val = (int32_t)(data[pos] & 0xFF);
+    dx_vm_set_field(self, "_position", DX_INT_VALUE(pos + 1));
+    frame->result = DX_INT_VALUE(byte_val);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// InputStream.read(byte[]) -> int  (fills array, returns count or -1)
+static DxResult native_inputstream_read_array(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    DxObject *buf_arr = (arg_count > 1 && args[1].tag == DX_VAL_OBJ) ? args[1].obj : NULL;
+
+    if (!self || !buf_arr || !buf_arr->is_array) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DxValue data_val, size_val, pos_val;
+    if (dx_vm_get_field(self, "_data", &data_val) != DX_OK || data_val.tag != DX_VAL_LONG) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    dx_vm_get_field(self, "_size", &size_val);
+    dx_vm_get_field(self, "_position", &pos_val);
+
+    uint8_t *data = (uint8_t *)(uintptr_t)data_val.l;
+    int32_t size = size_val.i;
+    int32_t pos = pos_val.i;
+
+    if (!data || pos >= size) {
+        frame->result = DX_INT_VALUE(-1);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    int32_t remaining = size - pos;
+    int32_t to_read = (int32_t)buf_arr->array_length;
+    if (to_read > remaining) to_read = remaining;
+
+    for (int32_t i = 0; i < to_read; i++) {
+        buf_arr->array_elements[i] = DX_INT_VALUE((int32_t)(data[pos + i] & 0xFF));
+    }
+
+    dx_vm_set_field(self, "_position", DX_INT_VALUE(pos + to_read));
+    frame->result = DX_INT_VALUE(to_read);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// InputStream.available() -> int (remaining bytes)
+static DxResult native_inputstream_available(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)arg_count;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self) {
+        frame->result = DX_INT_VALUE(0);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    DxValue data_val, size_val, pos_val;
+    if (dx_vm_get_field(self, "_data", &data_val) != DX_OK || data_val.tag != DX_VAL_LONG) {
+        frame->result = DX_INT_VALUE(0);
+        frame->has_result = true;
+        return DX_OK;
+    }
+
+    dx_vm_get_field(self, "_size", &size_val);
+    dx_vm_get_field(self, "_position", &pos_val);
+
+    int32_t remaining = size_val.i - pos_val.i;
+    if (remaining < 0) remaining = 0;
+
+    frame->result = DX_INT_VALUE(remaining);
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// InputStream.close() — free the data buffer
+static DxResult native_inputstream_close(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)arg_count;
+    DxObject *self = (arg_count > 0 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self) {
+        DxValue data_val;
+        if (dx_vm_get_field(self, "_data", &data_val) == DX_OK && data_val.tag == DX_VAL_LONG && data_val.l != 0) {
+            free((void *)(uintptr_t)data_val.l);
+            dx_vm_set_field(self, "_data", (DxValue){.tag = DX_VAL_LONG, .l = 0});
+            dx_vm_set_field(self, "_size", DX_INT_VALUE(0));
+            dx_vm_set_field(self, "_position", DX_INT_VALUE(0));
+        }
+    }
+    return DX_OK;
+}
+
+// ============================================================
+// Context.getAssets — return AssetManager instance
+// ============================================================
+
+static DxResult native_context_get_assets(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    DxClass *am_cls = dx_vm_find_class(vm, "Landroid/content/res/AssetManager;");
+    if (!am_cls) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+    DxObject *am = dx_vm_alloc_object(vm, am_cls);
+    frame->result = am ? DX_OBJ_VALUE(am) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// Context.openFileInput / openFileOutput
+// ============================================================
+
+static DxResult native_context_open_file_input(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    const char *name = NULL;
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        name = dx_vm_get_string_value(args[1].obj);
+    }
+    DX_INFO("Context", "openFileInput(\"%s\")", name ? name : "null");
+
+    // Return an empty InputStream (no data, immediate EOF)
+    DxClass *is_cls = dx_vm_find_class(vm, "Ljava/io/FileInputStream;");
+    if (!is_cls) is_cls = dx_vm_find_class(vm, "Ljava/io/InputStream;");
+    DxObject *is_obj = is_cls ? dx_vm_alloc_object(vm, is_cls) : NULL;
+    if (is_obj) {
+        // No data buffer — reads will return -1 (file not found / empty)
+        dx_vm_set_field(is_obj, "_data", (DxValue){.tag = DX_VAL_LONG, .l = 0});
+        dx_vm_set_field(is_obj, "_size", DX_INT_VALUE(0));
+        dx_vm_set_field(is_obj, "_position", DX_INT_VALUE(0));
+    }
+    frame->result = is_obj ? DX_OBJ_VALUE(is_obj) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_context_open_file_output(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    const char *name = NULL;
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        name = dx_vm_get_string_value(args[1].obj);
+    }
+    DX_INFO("Context", "openFileOutput(\"%s\")", name ? name : "null");
+
+    // Return a stub OutputStream
+    DxClass *os_cls = dx_vm_find_class(vm, "Ljava/io/FileOutputStream;");
+    if (!os_cls) os_cls = dx_vm_find_class(vm, "Ljava/io/OutputStream;");
+    DxObject *os_obj = os_cls ? dx_vm_alloc_object(vm, os_cls) : NULL;
+    frame->result = os_obj ? DX_OBJ_VALUE(os_obj) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// File.createTempFile — static method returning File with temp path
+// ============================================================
+
+static DxResult native_file_create_temp_file(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    const char *prefix = "tmp";
+    const char *suffix = ".tmp";
+
+    if (arg_count > 0 && args[0].tag == DX_VAL_OBJ && args[0].obj) {
+        const char *p = dx_vm_get_string_value(args[0].obj);
+        if (p) prefix = p;
+    }
+    if (arg_count > 1 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        const char *s = dx_vm_get_string_value(args[1].obj);
+        if (s) suffix = s;
+    }
+
+    // Generate a unique temp path
+    static uint32_t temp_counter = 0;
+    char path[512];
+    snprintf(path, sizeof(path), "/data/data/app/cache/%s%u%s", prefix, temp_counter++, suffix);
+
+    DX_DEBUG("File", "createTempFile(\"%s\", \"%s\") -> %s", prefix, suffix, path);
+
+    DxObject *file_obj = create_file_object(vm, path);
+    frame->result = file_obj ? DX_OBJ_VALUE(file_obj) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// File.toString — returns the path string
+// ============================================================
+
+static DxResult native_file_to_string(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)arg_count;
+    DxObject *self = args[0].obj;
+    if (self && self->fields && self->klass && self->klass->instance_field_count > 0
+        && self->fields[0].tag == DX_VAL_OBJ && self->fields[0].obj) {
+        frame->result = self->fields[0];
+    } else {
+        DxObject *str = dx_vm_create_string(vm, "");
+        frame->result = str ? DX_OBJ_VALUE(str) : DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
 // AlertDialog.Builder — builder pattern
 // ============================================================
 
@@ -4467,22 +4990,28 @@ static DxResult native_semaphore_available_permits(DxVM *vm, DxFrame *frame, DxV
 
 static DxResult native_executor_submit(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
     // args[0] = this (ExecutorService), args[1] = Runnable/Callable
+    DxValue call_result = DX_NULL_VALUE;
     if (arg_count >= 2 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
         DxObject *runnable = args[1].obj;
-        DxMethod *run_method = dx_vm_find_method(runnable->klass, "run", NULL);
-        if (!run_method) {
-            run_method = dx_vm_find_method(runnable->klass, "call", NULL);
-        }
-        if (run_method) {
+        // Try call() first (Callable), then run() (Runnable)
+        DxMethod *call_method = dx_vm_find_method(runnable->klass, "call", NULL);
+        DxMethod *run_method = call_method ? NULL : dx_vm_find_method(runnable->klass, "run", NULL);
+        DxMethod *method = call_method ? call_method : run_method;
+        if (method) {
             DxValue run_args[1] = { DX_OBJ_VALUE(runnable) };
-            dx_vm_execute_method(vm, run_method, run_args, 1, NULL);
+            DxValue result_val = DX_NULL_VALUE;
+            dx_vm_execute_method(vm, method, run_args, 1, &result_val);
             if (vm->pending_exception) vm->pending_exception = NULL;
+            if (call_method) call_result = result_val; // store Callable result
         }
     }
-    // Return a Future stub
+    // Return a Future with stored result
     DxClass *future_cls = dx_vm_find_class(vm, "Ljava/util/concurrent/Future;");
     if (future_cls) {
         DxObject *future = dx_vm_alloc_object(vm, future_cls);
+        if (future && future->fields && future_cls->instance_field_count > 0) {
+            future->fields[0] = call_result; // store result in field[0]
+        }
         frame->result = future ? DX_OBJ_VALUE(future) : DX_NULL_VALUE;
     } else {
         frame->result = DX_NULL_VALUE;
@@ -4504,6 +5033,146 @@ static DxResult native_executors_new_pool(DxVM *vm, DxFrame *frame, DxValue *arg
     } else {
         frame->result = DX_NULL_VALUE;
     }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// Future.get() — return stored value from field[0]
+// ============================================================
+
+static DxResult native_future_get(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    DxObject *self = (arg_count >= 1 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count > 0) {
+        frame->result = self->fields[0];
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
+// CompletableFuture — field[0] stores value
+// ============================================================
+
+static DxResult native_cf_completed_future(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    // static: args[0] = value
+    DxClass *cf_cls = dx_vm_find_class(vm, "Ljava/util/concurrent/CompletableFuture;");
+    if (cf_cls) {
+        DxObject *cf = dx_vm_alloc_object(vm, cf_cls);
+        if (cf && cf->fields && cf_cls->instance_field_count > 0) {
+            cf->fields[0] = (arg_count >= 1) ? args[0] : DX_NULL_VALUE;
+        }
+        frame->result = cf ? DX_OBJ_VALUE(cf) : DX_NULL_VALUE;
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_cf_then_apply(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    // args[0] = this (CompletableFuture), args[1] = Function
+    DxValue current_val = DX_NULL_VALUE;
+    DxObject *self = (arg_count >= 1 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count > 0) {
+        current_val = self->fields[0];
+    }
+
+    DxValue new_val = DX_NULL_VALUE;
+    if (arg_count >= 2 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        DxObject *func = args[1].obj;
+        DxMethod *apply = dx_vm_find_method(func->klass, "apply", NULL);
+        if (apply) {
+            DxValue apply_args[2] = { DX_OBJ_VALUE(func), current_val };
+            dx_vm_execute_method(vm, apply, apply_args, 2, &new_val);
+            if (vm->pending_exception) vm->pending_exception = NULL;
+        }
+    }
+
+    // Return new CompletableFuture with transformed value
+    DxClass *cf_cls = dx_vm_find_class(vm, "Ljava/util/concurrent/CompletableFuture;");
+    if (cf_cls) {
+        DxObject *cf = dx_vm_alloc_object(vm, cf_cls);
+        if (cf && cf->fields && cf_cls->instance_field_count > 0) {
+            cf->fields[0] = new_val;
+        }
+        frame->result = cf ? DX_OBJ_VALUE(cf) : DX_NULL_VALUE;
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_cf_then_accept(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    // args[0] = this (CompletableFuture), args[1] = Consumer
+    DxValue current_val = DX_NULL_VALUE;
+    DxObject *self = (arg_count >= 1 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count > 0) {
+        current_val = self->fields[0];
+    }
+
+    if (arg_count >= 2 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        DxObject *consumer = args[1].obj;
+        DxMethod *accept = dx_vm_find_method(consumer->klass, "accept", NULL);
+        if (accept) {
+            DxValue accept_args[2] = { DX_OBJ_VALUE(consumer), current_val };
+            dx_vm_execute_method(vm, accept, accept_args, 2, NULL);
+            if (vm->pending_exception) vm->pending_exception = NULL;
+        }
+    }
+
+    // Return new CompletableFuture with same value
+    DxClass *cf_cls = dx_vm_find_class(vm, "Ljava/util/concurrent/CompletableFuture;");
+    if (cf_cls) {
+        DxObject *cf = dx_vm_alloc_object(vm, cf_cls);
+        if (cf && cf->fields && cf_cls->instance_field_count > 0) {
+            cf->fields[0] = current_val;
+        }
+        frame->result = cf ? DX_OBJ_VALUE(cf) : DX_NULL_VALUE;
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_cf_then_run(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    // args[0] = this (CompletableFuture), args[1] = Runnable
+    if (arg_count >= 2 && args[1].tag == DX_VAL_OBJ && args[1].obj) {
+        DxObject *runnable = args[1].obj;
+        DxMethod *run = dx_vm_find_method(runnable->klass, "run", NULL);
+        if (run) {
+            DxValue run_args[1] = { DX_OBJ_VALUE(runnable) };
+            dx_vm_execute_method(vm, run, run_args, 1, NULL);
+            if (vm->pending_exception) vm->pending_exception = NULL;
+        }
+    }
+
+    // Return new CompletableFuture with null value
+    DxClass *cf_cls = dx_vm_find_class(vm, "Ljava/util/concurrent/CompletableFuture;");
+    if (cf_cls) {
+        DxObject *cf = dx_vm_alloc_object(vm, cf_cls);
+        frame->result = cf ? DX_OBJ_VALUE(cf) : DX_NULL_VALUE;
+    } else {
+        frame->result = DX_NULL_VALUE;
+    }
+    frame->has_result = true;
+    return DX_OK;
+}
+
+static DxResult native_cf_complete(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm;
+    // args[0] = this, args[1] = value
+    DxObject *self = (arg_count >= 1 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (self && self->fields && self->klass && self->klass->instance_field_count > 0
+        && arg_count >= 2) {
+        self->fields[0] = args[1];
+    }
+    frame->result = DX_INT_VALUE(1); // return true
     frame->has_result = true;
     return DX_OK;
 }
@@ -4715,7 +5384,21 @@ static DxResult native_dispatchers_get(DxVM *vm, DxFrame *frame, DxValue *args, 
 }
 
 // ============================================================
-// Thread.start() — invoke this.run() synchronously
+// Thread.<init>(Runnable) — store Runnable target in field[0]
+// ============================================================
+
+static DxResult native_thread_init_runnable(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)vm; (void)frame;
+    if (arg_count >= 2 && args[0].tag == DX_VAL_OBJ && args[0].obj
+        && args[0].obj->fields && args[0].obj->klass
+        && args[0].obj->klass->instance_field_count > 0) {
+        args[0].obj->fields[0] = args[1]; // store Runnable target
+    }
+    return DX_OK;
+}
+
+// ============================================================
+// Thread.start() — invoke Runnable.run() or this.run() synchronously
 // ============================================================
 
 static DxResult native_thread_start(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
@@ -4723,13 +5406,32 @@ static DxResult native_thread_start(DxVM *vm, DxFrame *frame, DxValue *args, uin
     if (arg_count < 1 || args[0].tag != DX_VAL_OBJ || !args[0].obj) return DX_OK;
 
     DxObject *thread_obj = args[0].obj;
+
+    // First, check if a Runnable target was stored in field[0]
+    if (thread_obj->fields && thread_obj->klass
+        && thread_obj->klass->instance_field_count > 0
+        && thread_obj->fields[0].tag == DX_VAL_OBJ
+        && thread_obj->fields[0].obj) {
+        DxObject *runnable = thread_obj->fields[0].obj;
+        DxMethod *run_method = dx_vm_find_method(runnable->klass, "run", NULL);
+        if (run_method) {
+            DX_DEBUG("Thread", "start() executing Runnable.run() synchronously on %s",
+                    runnable->klass ? runnable->klass->descriptor : "?");
+            DxValue run_args[1] = { DX_OBJ_VALUE(runnable) };
+            dx_vm_execute_method(vm, run_method, run_args, 1, NULL);
+            if (vm->pending_exception) vm->pending_exception = NULL;
+            return DX_OK;
+        }
+    }
+
+    // Fallback: call this.run() (for Thread subclasses that override run())
     DxMethod *run_method = dx_vm_find_method(thread_obj->klass, "run", NULL);
     if (run_method) {
         DX_DEBUG("Thread", "start() executing run() synchronously on %s",
                 thread_obj->klass ? thread_obj->klass->descriptor : "?");
         DxValue run_args[1] = { DX_OBJ_VALUE(thread_obj) };
         dx_vm_execute_method(vm, run_method, run_args, 1, NULL);
-        if (vm->pending_exception) vm->pending_exception = NULL; // absorb
+        if (vm->pending_exception) vm->pending_exception = NULL;
     }
     return DX_OK;
 }
@@ -6811,6 +7513,60 @@ static DxResult native_content_resolver_update(DxVM *vm, DxFrame *frame, DxValue
 }
 
 // ============================================================
+// Configuration field layout:
+//   field 0: orientation (int)       ORIENTATION_PORTRAIT=1, ORIENTATION_LANDSCAPE=2
+//   field 1: screenWidthDp (int)
+//   field 2: screenHeightDp (int)
+//   field 3: locale (String)         e.g. "en_US"
+//   field 4: densityDpi (int)
+// ============================================================
+#define DX_CONFIG_FIELD_ORIENTATION    0
+#define DX_CONFIG_FIELD_SCREEN_W_DP   1
+#define DX_CONFIG_FIELD_SCREEN_H_DP   2
+#define DX_CONFIG_FIELD_LOCALE        3
+#define DX_CONFIG_FIELD_DENSITY_DPI   4
+#define DX_CONFIG_FIELD_COUNT         5
+
+// Configuration.<init>() -- set sensible defaults
+static DxResult native_config_init(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)frame;
+    DxObject *self = (arg_count >= 1 && args[0].tag == DX_VAL_OBJ) ? args[0].obj : NULL;
+    if (!self || !self->fields) return DX_OK;
+
+    // Defaults: portrait, 393x852 dp (iPhone-ish), en_US, 440 dpi
+    if (self->klass && self->klass->instance_field_count >= DX_CONFIG_FIELD_COUNT) {
+        self->fields[DX_CONFIG_FIELD_ORIENTATION]  = DX_INT_VALUE(1); // PORTRAIT
+        self->fields[DX_CONFIG_FIELD_SCREEN_W_DP]  = DX_INT_VALUE(393);
+        self->fields[DX_CONFIG_FIELD_SCREEN_H_DP]  = DX_INT_VALUE(852);
+        self->fields[DX_CONFIG_FIELD_LOCALE]       = DX_OBJ_VALUE(dx_vm_create_string(vm, "en_US"));
+        self->fields[DX_CONFIG_FIELD_DENSITY_DPI]  = DX_INT_VALUE(440);
+    }
+    return DX_OK;
+}
+
+// Resources.getConfiguration() -> Configuration
+static DxResult native_resources_get_configuration(DxVM *vm, DxFrame *frame, DxValue *args, uint32_t arg_count) {
+    (void)args; (void)arg_count;
+    DxClass *config_cls = dx_vm_find_class(vm, "Landroid/content/res/Configuration;");
+    if (!config_cls) {
+        frame->result = DX_NULL_VALUE;
+        frame->has_result = true;
+        return DX_OK;
+    }
+    DxObject *config = dx_vm_alloc_object(vm, config_cls);
+    if (config && config->fields && config_cls->instance_field_count >= DX_CONFIG_FIELD_COUNT) {
+        config->fields[DX_CONFIG_FIELD_ORIENTATION]  = DX_INT_VALUE(1);
+        config->fields[DX_CONFIG_FIELD_SCREEN_W_DP]  = DX_INT_VALUE(393);
+        config->fields[DX_CONFIG_FIELD_SCREEN_H_DP]  = DX_INT_VALUE(852);
+        config->fields[DX_CONFIG_FIELD_LOCALE]       = DX_OBJ_VALUE(dx_vm_create_string(vm, "en_US"));
+        config->fields[DX_CONFIG_FIELD_DENSITY_DPI]  = DX_INT_VALUE(440);
+    }
+    frame->result = config ? DX_OBJ_VALUE(config) : DX_NULL_VALUE;
+    frame->has_result = true;
+    return DX_OK;
+}
+
+// ============================================================
 // java.nio.ByteBuffer native methods
 // ============================================================
 
@@ -7519,7 +8275,11 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(context_cls, "getContentResolver", "L", DX_ACC_PUBLIC,
                native_context_get_content_resolver, false);
     add_method(context_cls, "getAssets", "L", DX_ACC_PUBLIC,
-               native_return_new_object, false);
+               native_context_get_assets, false);
+    add_method(context_cls, "openFileInput", "LL", DX_ACC_PUBLIC,
+               native_context_open_file_input, false);
+    add_method(context_cls, "openFileOutput", "LLI", DX_ACC_PUBLIC,
+               native_context_open_file_output, false);
     add_method(context_cls, "getTheme", "L", DX_ACC_PUBLIC,
                native_return_new_object, false);
     add_method(context_cls, "obtainStyledAttributes", "LLI", DX_ACC_PUBLIC,
@@ -7598,6 +8358,14 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_return_false, false);
     add_method(activity_cls, "onRequestPermissionsResult", "VILL", DX_ACC_PUBLIC,
                native_noop, false);
+    add_method(activity_cls, "onSaveInstanceState", "VL", DX_ACC_PROTECTED,
+               native_activity_on_save_instance_state, false);
+    add_method(activity_cls, "onRestoreInstanceState", "VL", DX_ACC_PROTECTED,
+               native_activity_on_restore_instance_state, false);
+    add_method(activity_cls, "onConfigurationChanged", "VL", DX_ACC_PUBLIC,
+               native_activity_on_config_changed, false);
+    add_method(activity_cls, "recreate", "V", DX_ACC_PUBLIC,
+               native_activity_recreate, false);
 
     // android.view.View
     DxClass *view_cls = reg_class(vm, "Landroid/view/View;", obj);
@@ -8877,10 +9645,41 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(resolver_cls, "notifyChange", "VLZ", DX_ACC_PUBLIC,
                native_noop, false);
 
-    // android.content.res.Configuration
+    // android.content.res.Configuration — field-backed with static constants
     DxClass *config_cls = reg_class(vm, "Landroid/content/res/Configuration;", obj);
+    config_cls->instance_field_count = DX_CONFIG_FIELD_COUNT;
     add_method(config_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
-               native_noop, true);
+               native_config_init, true);
+    // Static constants + instance field_defs
+    {
+        config_cls->static_field_count = 2;
+        config_cls->static_fields = (DxValue *)dx_malloc(sizeof(DxValue) * 2);
+        if (config_cls->static_fields) {
+            config_cls->static_fields[0] = DX_INT_VALUE(1); // ORIENTATION_PORTRAIT
+            config_cls->static_fields[1] = DX_INT_VALUE(2); // ORIENTATION_LANDSCAPE
+        }
+        // field_defs: [0..4] = instance fields, [5..6] not needed since add_static_fields
+        // uses separate indexing, but dx_vm_set/get_field only looks at [0..own_count-1]
+        config_cls->field_defs = dx_malloc(sizeof(*config_cls->field_defs) * (DX_CONFIG_FIELD_COUNT + 2));
+        if (config_cls->field_defs) {
+            memset(config_cls->field_defs, 0, sizeof(*config_cls->field_defs) * (DX_CONFIG_FIELD_COUNT + 2));
+            config_cls->field_defs[0].name = "orientation";
+            config_cls->field_defs[0].type = "I";
+            config_cls->field_defs[0].flags = DX_ACC_PUBLIC;
+            config_cls->field_defs[1].name = "screenWidthDp";
+            config_cls->field_defs[1].type = "I";
+            config_cls->field_defs[1].flags = DX_ACC_PUBLIC;
+            config_cls->field_defs[2].name = "screenHeightDp";
+            config_cls->field_defs[2].type = "I";
+            config_cls->field_defs[2].flags = DX_ACC_PUBLIC;
+            config_cls->field_defs[3].name = "locale";
+            config_cls->field_defs[3].type = "Ljava/util/Locale;";
+            config_cls->field_defs[3].flags = DX_ACC_PUBLIC;
+            config_cls->field_defs[4].name = "densityDpi";
+            config_cls->field_defs[4].type = "I";
+            config_cls->field_defs[4].flags = DX_ACC_PUBLIC;
+        }
+    }
 
     // android.content.res.ColorStateList
     DxClass *csl_cls = reg_class(vm, "Landroid/content/res/ColorStateList;", obj);
@@ -8922,58 +9721,237 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(receiver_cls, "goAsync", "L", DX_ACC_PUBLIC,
                native_return_null, false);
 
-    // android.animation.Animator
+    // android.animation.Animator (base class)
     DxClass *animator_cls = reg_class(vm, "Landroid/animation/Animator;", obj);
     add_method(animator_cls, "start", "V", DX_ACC_PUBLIC,
                native_noop, false);
     add_method(animator_cls, "cancel", "V", DX_ACC_PUBLIC,
                native_noop, false);
+    add_method(animator_cls, "end", "V", DX_ACC_PUBLIC,
+               native_noop, false);
     add_method(animator_cls, "addListener", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(animator_cls, "removeListener", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(animator_cls, "removeAllListeners", "V", DX_ACC_PUBLIC,
                native_noop, false);
     add_method(animator_cls, "setDuration", "LJ", DX_ACC_PUBLIC,
                native_return_self, false);
+    add_method(animator_cls, "getDuration", "J", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(animator_cls, "setStartDelay", "VJ", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(animator_cls, "getStartDelay", "J", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(animator_cls, "isRunning", "Z", DX_ACC_PUBLIC,
+               native_return_false, false);
+    add_method(animator_cls, "isStarted", "Z", DX_ACC_PUBLIC,
+               native_return_false, false);
+    add_method(animator_cls, "setTarget", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(animator_cls, "clone", "L", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(animator_cls, "setInterpolator", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+
+    // android.animation.Animator$AnimatorListener (interface)
+    DxClass *anim_listener_cls = reg_class(vm, "Landroid/animation/Animator$AnimatorListener;", obj);
+    add_method(anim_listener_cls, "onAnimationStart", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_listener_cls, "onAnimationEnd", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_listener_cls, "onAnimationCancel", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_listener_cls, "onAnimationRepeat", "VL", DX_ACC_PUBLIC, native_noop, false);
+
+    // android.animation.AnimatorListenerAdapter (abstract, implements AnimatorListener)
+    DxClass *anim_listener_adapter_cls = reg_class(vm, "Landroid/animation/AnimatorListenerAdapter;", anim_listener_cls);
+    add_method(anim_listener_adapter_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(anim_listener_adapter_cls, "onAnimationStart", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_listener_adapter_cls, "onAnimationEnd", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_listener_adapter_cls, "onAnimationCancel", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_listener_adapter_cls, "onAnimationRepeat", "VL", DX_ACC_PUBLIC, native_noop, false);
 
     // android.animation.ValueAnimator (extends Animator)
     DxClass *vanim_cls = reg_class(vm, "Landroid/animation/ValueAnimator;", animator_cls);
+    add_method(vanim_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
     add_method(vanim_cls, "ofFloat", "L", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_null, true);
+               native_return_new_object, true);
     add_method(vanim_cls, "ofInt", "L", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_null, true);
+               native_return_new_object, true);
+    add_method(vanim_cls, "ofArgb", "L", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_new_object, true);
+    add_method(vanim_cls, "ofPropertyValuesHolder", "L", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_new_object, true);
     add_method(vanim_cls, "addUpdateListener", "VL", DX_ACC_PUBLIC,
                native_noop, false);
+    add_method(vanim_cls, "removeUpdateListener", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(vanim_cls, "removeAllUpdateListeners", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(vanim_cls, "setRepeatCount", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(vanim_cls, "getRepeatCount", "I", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(vanim_cls, "setRepeatMode", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(vanim_cls, "getRepeatMode", "I", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(vanim_cls, "getAnimatedValue", "L", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(vanim_cls, "getAnimatedFraction", "F", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(vanim_cls, "setFloatValues", "V", DX_ACC_PUBLIC,
+               native_noop, true);
+    add_method(vanim_cls, "setIntValues", "V", DX_ACC_PUBLIC,
+               native_noop, true);
+    add_method(vanim_cls, "setEvaluator", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(vanim_cls, "setCurrentPlayTime", "VJ", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(vanim_cls, "getCurrentPlayTime", "J", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    add_method(vanim_cls, "reverse", "V", DX_ACC_PUBLIC,
+               native_noop, false);
+
+    // android.animation.ValueAnimator$AnimatorUpdateListener (interface)
+    DxClass *update_listener_cls = reg_class(vm, "Landroid/animation/ValueAnimator$AnimatorUpdateListener;", obj);
+    add_method(update_listener_cls, "onAnimationUpdate", "VL", DX_ACC_PUBLIC, native_noop, false);
 
     // android.animation.ObjectAnimator (extends ValueAnimator)
     DxClass *oanim_cls = reg_class(vm, "Landroid/animation/ObjectAnimator;", vanim_cls);
+    add_method(oanim_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
     add_method(oanim_cls, "ofFloat", "LLLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_null, true);
+               native_return_new_object, true);
+    add_method(oanim_cls, "ofInt", "LLLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_new_object, true);
+    add_method(oanim_cls, "ofArgb", "LLLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_new_object, true);
+    add_method(oanim_cls, "ofPropertyValuesHolder", "LLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_new_object, true);
+    add_method(oanim_cls, "setAutoCancel", "VZ", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(oanim_cls, "setPropertyName", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(oanim_cls, "getPropertyName", "L", DX_ACC_PUBLIC,
+               native_return_null, false);
 
     // android.animation.AnimatorSet (extends Animator)
     DxClass *anim_set_animator_cls = reg_class(vm, "Landroid/animation/AnimatorSet;", animator_cls);
     add_method(anim_set_animator_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
-    add_method(anim_set_animator_cls, "playTogether", "VL", DX_ACC_PUBLIC, native_noop, false);
-    add_method(anim_set_animator_cls, "playSequentially", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_set_animator_cls, "playTogether", "VL", DX_ACC_PUBLIC, native_noop, true);
+    add_method(anim_set_animator_cls, "playSequentially", "VL", DX_ACC_PUBLIC, native_noop, true);
+    add_method(anim_set_animator_cls, "play", "LL", DX_ACC_PUBLIC,
+               native_return_new_object, false);
     add_method(anim_set_animator_cls, "start", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_set_animator_cls, "cancel", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_set_animator_cls, "end", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_set_animator_cls, "clone", "L", DX_ACC_PUBLIC,
+               native_return_new_object, false);
+
+    // android.animation.AnimatorSet$Builder
+    DxClass *anim_set_builder_cls = reg_class(vm, "Landroid/animation/AnimatorSet$Builder;", obj);
+    add_method(anim_set_builder_cls, "with", "LL", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(anim_set_builder_cls, "before", "LL", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(anim_set_builder_cls, "after", "LL", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(anim_set_builder_cls, "after", "LJ", DX_ACC_PUBLIC,
+               native_return_self, false);
 
     // android.animation.PropertyValuesHolder
     DxClass *pvh_cls = reg_class(vm, "Landroid/animation/PropertyValuesHolder;", obj);
     add_method(pvh_cls, "ofFloat", "LLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_null, true);
+               native_return_new_object, true);
     add_method(pvh_cls, "ofInt", "LLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_null, true);
+               native_return_new_object, true);
+    add_method(pvh_cls, "ofKeyframe", "LLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_new_object, true);
+    add_method(pvh_cls, "setEvaluator", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+
+    // android.animation.Keyframe
+    DxClass *keyframe_cls = reg_class(vm, "Landroid/animation/Keyframe;", obj);
+    add_method(keyframe_cls, "ofFloat", "LFF", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_new_object, false);
+    add_method(keyframe_cls, "ofInt", "LFI", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_new_object, false);
+    add_method(keyframe_cls, "setInterpolator", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+
+    // android.animation.TimeInterpolator (interface)
+    DxClass *time_interpolator_cls = reg_class(vm, "Landroid/animation/TimeInterpolator;", obj);
+    add_method(time_interpolator_cls, "getInterpolation", "FF", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+    (void)time_interpolator_cls;
+
+    // android.animation.TypeEvaluator (interface)
+    DxClass *type_evaluator_cls = reg_class(vm, "Landroid/animation/TypeEvaluator;", obj);
+    add_method(type_evaluator_cls, "evaluate", "LFLL", DX_ACC_PUBLIC,
+               native_return_null, false);
+    (void)type_evaluator_cls;
+
+    // android.animation.ArgbEvaluator
+    DxClass *argb_eval_cls = reg_class(vm, "Landroid/animation/ArgbEvaluator;", obj);
+    add_method(argb_eval_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    (void)argb_eval_cls;
+
+    // android.animation.LayoutTransition
+    DxClass *layout_transition_cls = reg_class(vm, "Landroid/animation/LayoutTransition;", obj);
+    add_method(layout_transition_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(layout_transition_cls, "setDuration", "VJ", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(layout_transition_cls, "setAnimator", "VIL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(layout_transition_cls, "enableTransitionType", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(layout_transition_cls, "disableTransitionType", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(layout_transition_cls, "setStartDelay", "VIJ", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(layout_transition_cls, "addTransitionListener", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
 
     // android.view.ViewPropertyAnimator
     DxClass *vpa_cls = reg_class(vm, "Landroid/view/ViewPropertyAnimator;", obj);
     add_method(vpa_cls, "alpha", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "alphaBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
     add_method(vpa_cls, "translationX", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "translationXBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
     add_method(vpa_cls, "translationY", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "translationYBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "translationZ", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "translationZBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
     add_method(vpa_cls, "scaleX", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "scaleXBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
     add_method(vpa_cls, "scaleY", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "scaleYBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
     add_method(vpa_cls, "rotation", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "rotationBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "rotationX", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "rotationXBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "rotationY", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "rotationYBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "x", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "xBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "y", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "yBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "z", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "zBy", "LF", DX_ACC_PUBLIC, native_return_self, false);
     add_method(vpa_cls, "setDuration", "LJ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "setStartDelay", "LJ", DX_ACC_PUBLIC, native_return_self, false);
     add_method(vpa_cls, "setInterpolator", "LL", DX_ACC_PUBLIC, native_return_self, false);
-    add_method(vpa_cls, "withEndAction", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "withStartAction", "LL", DX_ACC_PUBLIC, native_run_runnable_return_self, false);
+    add_method(vpa_cls, "withEndAction", "LL", DX_ACC_PUBLIC, native_run_runnable_return_self, false);
+    add_method(vpa_cls, "withLayer", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "setListener", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(vpa_cls, "setUpdateListener", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(vpa_cls, "start", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(vpa_cls, "cancel", "V", DX_ACC_PUBLIC, native_noop, false);
 
     // ============================================================
     // Additional methods on existing classes
@@ -9107,7 +10085,7 @@ DxResult dx_register_android_framework(DxVM *vm) {
 
     // Resources: additional methods
     add_method(resources_cls, "getConfiguration", "L", DX_ACC_PUBLIC,
-               native_return_new_object, false);
+               native_resources_get_configuration, false);
     add_method(resources_cls, "getInteger", "II", DX_ACC_PUBLIC,
                native_return_int_zero, false);
     add_method(resources_cls, "getDimensionPixelSize", "II", DX_ACC_PUBLIC,
@@ -9138,6 +10116,20 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_return_false, false);
     add_method(handler_cls, "removeCallbacksAndMessages", "VL", DX_ACC_PUBLIC,
                native_noop, false);
+    add_method(handler_cls, "<init>", "VLL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, true); // Handler(Looper, Callback)
+    add_method(handler_cls, "sendEmptyMessage", "ZI", DX_ACC_PUBLIC,
+               native_return_true, false);
+    add_method(handler_cls, "sendEmptyMessageDelayed", "ZIJ", DX_ACC_PUBLIC,
+               native_return_true, false);
+    add_method(handler_cls, "removeMessages", "VI", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(handler_cls, "removeCallbacks", "VL", DX_ACC_PUBLIC,
+               native_noop, false);
+    add_method(handler_cls, "hasMessages", "ZI", DX_ACC_PUBLIC,
+               native_return_false, false);
+    add_method(handler_cls, "getLooper", "L", DX_ACC_PUBLIC,
+               native_looper_get_main_looper, false);
 
     // Log: isLoggable
     add_method(log_cls, "isLoggable", "ZLI", DX_ACC_PUBLIC | DX_ACC_STATIC,
@@ -9771,10 +10763,28 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(animation_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
     add_method(animation_cls, "setDuration", "VJ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "getDuration", "J", DX_ACC_PUBLIC, native_return_int_zero, false);
     add_method(animation_cls, "setFillAfter", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "setFillBefore", "VZ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "setFillEnabled", "VZ", DX_ACC_PUBLIC, native_noop, false);
     add_method(animation_cls, "setInterpolator", "VL", DX_ACC_PUBLIC, native_noop, false);
     add_method(animation_cls, "setRepeatCount", "VI", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "setRepeatMode", "VI", DX_ACC_PUBLIC, native_noop, false);
     add_method(animation_cls, "setAnimationListener", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "setStartOffset", "VJ", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "start", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "startNow", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "cancel", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "reset", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(animation_cls, "hasStarted", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(animation_cls, "hasEnded", "Z", DX_ACC_PUBLIC, native_return_true, false);
+    add_method(animation_cls, "setZAdjustment", "VI", DX_ACC_PUBLIC, native_noop, false);
+
+    // android.view.animation.Animation$AnimationListener (interface)
+    DxClass *anim_anim_listener_cls = reg_class(vm, "Landroid/view/animation/Animation$AnimationListener;", obj);
+    add_method(anim_anim_listener_cls, "onAnimationStart", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_anim_listener_cls, "onAnimationEnd", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(anim_anim_listener_cls, "onAnimationRepeat", "VL", DX_ACC_PUBLIC, native_noop, false);
 
     DxClass *alpha_anim_cls = reg_class(vm, "Landroid/view/animation/AlphaAnimation;", animation_cls);
     add_method(alpha_anim_cls, "<init>", "VFF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
@@ -9783,13 +10793,23 @@ DxResult dx_register_android_framework(DxVM *vm) {
     DxClass *translate_anim_cls = reg_class(vm, "Landroid/view/animation/TranslateAnimation;", animation_cls);
     add_method(translate_anim_cls, "<init>", "VFFFF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
+    add_method(translate_anim_cls, "<init>", "VIFIFIFIF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
 
     DxClass *scale_anim_cls = reg_class(vm, "Landroid/view/animation/ScaleAnimation;", animation_cls);
     add_method(scale_anim_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
+    add_method(scale_anim_cls, "<init>", "VFFFF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(scale_anim_cls, "<init>", "VFFFFFFII", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
 
     DxClass *rotate_anim_cls = reg_class(vm, "Landroid/view/animation/RotateAnimation;", animation_cls);
     add_method(rotate_anim_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(rotate_anim_cls, "<init>", "VFF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(rotate_anim_cls, "<init>", "VFFFFIFIF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
 
     DxClass *anim_set_cls = reg_class(vm, "Landroid/view/animation/AnimationSet;", animation_cls);
@@ -9797,17 +10817,70 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_noop, false);
     add_method(anim_set_cls, "addAnimation", "VL", DX_ACC_PUBLIC, native_noop, false);
 
+    // android.view.animation.LayoutAnimationController
+    DxClass *layout_anim_ctrl_cls = reg_class(vm, "Landroid/view/animation/LayoutAnimationController;", obj);
+    add_method(layout_anim_ctrl_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(layout_anim_ctrl_cls, "<init>", "VLF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(layout_anim_ctrl_cls, "setDelay", "VF", DX_ACC_PUBLIC, native_noop, false);
+    add_method(layout_anim_ctrl_cls, "setOrder", "VI", DX_ACC_PUBLIC, native_noop, false);
+    add_method(layout_anim_ctrl_cls, "setInterpolator", "VL", DX_ACC_PUBLIC, native_noop, false);
+
     DxClass *anim_utils_cls = reg_class(vm, "Landroid/view/animation/AnimationUtils;", obj);
     add_method(anim_utils_cls, "loadAnimation", "LLI", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_null, true);
+               native_return_new_object, true);
+    add_method(anim_utils_cls, "loadInterpolator", "LLI", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_new_object, true);
+    add_method(anim_utils_cls, "currentAnimationTimeMillis", "J", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_return_int_zero, true);
 
+    // android.view.animation.Interpolator (interface) and implementations
     DxClass *interpolator_cls = reg_class(vm, "Landroid/view/animation/Interpolator;", obj);
-    (void)interpolator_cls;
-    DxClass *accel_decel_cls = reg_class(vm, "Landroid/view/animation/AccelerateDecelerateInterpolator;", obj);
+    add_method(interpolator_cls, "getInterpolation", "FF", DX_ACC_PUBLIC,
+               native_return_int_zero, false);
+
+    DxClass *accel_decel_cls = reg_class(vm, "Landroid/view/animation/AccelerateDecelerateInterpolator;", interpolator_cls);
     add_method(accel_decel_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
-    DxClass *linear_interp_cls = reg_class(vm, "Landroid/view/animation/LinearInterpolator;", obj);
+    DxClass *linear_interp_cls = reg_class(vm, "Landroid/view/animation/LinearInterpolator;", interpolator_cls);
     add_method(linear_interp_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    DxClass *accel_interp_cls = reg_class(vm, "Landroid/view/animation/AccelerateInterpolator;", interpolator_cls);
+    add_method(accel_interp_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(accel_interp_cls, "<init>", "VF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    DxClass *decel_interp_cls = reg_class(vm, "Landroid/view/animation/DecelerateInterpolator;", interpolator_cls);
+    add_method(decel_interp_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(decel_interp_cls, "<init>", "VF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    DxClass *overshoot_interp_cls = reg_class(vm, "Landroid/view/animation/OvershootInterpolator;", interpolator_cls);
+    add_method(overshoot_interp_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(overshoot_interp_cls, "<init>", "VF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    DxClass *bounce_interp_cls = reg_class(vm, "Landroid/view/animation/BounceInterpolator;", interpolator_cls);
+    add_method(bounce_interp_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    DxClass *anticipate_interp_cls = reg_class(vm, "Landroid/view/animation/AnticipateInterpolator;", interpolator_cls);
+    add_method(anticipate_interp_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(anticipate_interp_cls, "<init>", "VF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    DxClass *anticipate_overshoot_cls = reg_class(vm, "Landroid/view/animation/AnticipateOvershootInterpolator;", interpolator_cls);
+    add_method(anticipate_overshoot_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    DxClass *cycle_interp_cls = reg_class(vm, "Landroid/view/animation/CycleInterpolator;", interpolator_cls);
+    add_method(cycle_interp_cls, "<init>", "VF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    DxClass *path_interp_cls = reg_class(vm, "Landroid/view/animation/PathInterpolator;", interpolator_cls);
+    add_method(path_interp_cls, "<init>", "VFF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(path_interp_cls, "<init>", "VFFFF", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(path_interp_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
 
     // --- android.widget.AbsListView (extends ViewGroup) ---
@@ -10303,8 +11376,9 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_noop, false);
 
     DxClass *asset_mgr_cls = reg_class(vm, "Landroid/content/res/AssetManager;", obj);
-    add_method(asset_mgr_cls, "open", "LL", DX_ACC_PUBLIC, native_return_null, false);
-    add_method(asset_mgr_cls, "list", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(asset_mgr_cls, "open", "LL", DX_ACC_PUBLIC, native_asset_manager_open, false);
+    add_method(asset_mgr_cls, "open", "LLI", DX_ACC_PUBLIC, native_asset_manager_open, false); // open(name, accessMode)
+    add_method(asset_mgr_cls, "list", "LL", DX_ACC_PUBLIC, native_asset_manager_list, false);
 
     DxClass *pkg_info_cls = reg_class(vm, "Landroid/content/pm/PackageInfo;", obj);
     add_method(pkg_info_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
@@ -10766,14 +11840,21 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(file_cls, "renameTo", "ZL", DX_ACC_PUBLIC,
                native_return_false, false);
     add_method(file_cls, "createTempFile", "LLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
-               native_return_null, true);
+               native_file_create_temp_file, true);
+    add_method(file_cls, "createTempFile", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_file_create_temp_file, true);
+    add_method(file_cls, "toString", "L", DX_ACC_PUBLIC,
+               native_file_to_string, false);
+    add_method(file_cls, "getParent", "L", DX_ACC_PUBLIC,
+               native_return_null, false);
 
-    // java.io.InputStream (abstract base)
+    // java.io.InputStream (field-backed with _data/_size/_position)
     DxClass *inputstream_cls = reg_class(vm, "Ljava/io/InputStream;", obj);
-    add_method(inputstream_cls, "read", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
-    add_method(inputstream_cls, "read", "IL", DX_ACC_PUBLIC, native_return_int_zero, false); // read(byte[])
-    add_method(inputstream_cls, "close", "V", DX_ACC_PUBLIC, native_noop, false);
-    add_method(inputstream_cls, "available", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
+    inputstream_cls->instance_field_count = 3; // _data (long ptr), _size (int), _position (int)
+    add_method(inputstream_cls, "read", "I", DX_ACC_PUBLIC, native_inputstream_read, false);
+    add_method(inputstream_cls, "read", "IL", DX_ACC_PUBLIC, native_inputstream_read_array, false); // read(byte[])
+    add_method(inputstream_cls, "close", "V", DX_ACC_PUBLIC, native_inputstream_close, false);
+    add_method(inputstream_cls, "available", "I", DX_ACC_PUBLIC, native_inputstream_available, false);
 
     // java.io.OutputStream (abstract base)
     DxClass *outputstream_cls = reg_class(vm, "Ljava/io/OutputStream;", obj);
@@ -10782,13 +11863,14 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(outputstream_cls, "flush", "V", DX_ACC_PUBLIC, native_noop, false);
     add_method(outputstream_cls, "close", "V", DX_ACC_PUBLIC, native_noop, false);
 
-    // java.io.FileInputStream
+    // java.io.FileInputStream (inherits field-backed _data/_size/_position from InputStream)
     DxClass *fileinput_cls = reg_class(vm, "Ljava/io/FileInputStream;", inputstream_cls);
     add_method(fileinput_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, true);
-    add_method(fileinput_cls, "read", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
-    add_method(fileinput_cls, "close", "V", DX_ACC_PUBLIC, native_noop, false);
-    add_method(fileinput_cls, "available", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
+    add_method(fileinput_cls, "read", "I", DX_ACC_PUBLIC, native_inputstream_read, false);
+    add_method(fileinput_cls, "read", "IL", DX_ACC_PUBLIC, native_inputstream_read_array, false);
+    add_method(fileinput_cls, "close", "V", DX_ACC_PUBLIC, native_inputstream_close, false);
+    add_method(fileinput_cls, "available", "I", DX_ACC_PUBLIC, native_inputstream_available, false);
 
     // java.io.FileOutputStream
     DxClass *fileoutput_cls = reg_class(vm, "Ljava/io/FileOutputStream;", outputstream_cls);
@@ -11023,13 +12105,83 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_executors_new_pool, true);
     add_method(executors_cls, "newCachedThreadPool", "L", DX_ACC_PUBLIC | DX_ACC_STATIC,
                native_executors_new_pool, true);
+    add_method(executors_cls, "newScheduledThreadPool", "LI", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_executors_new_pool, true);
+    add_method(executors_cls, "newSingleThreadScheduledExecutor", "L", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_executors_new_pool, true);
+    add_method(executors_cls, "newWorkStealingPool", "L", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_executors_new_pool, true);
+    add_method(executors_cls, "newWorkStealingPool", "LI", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_executors_new_pool, true);
 
     DxClass *future_cls = reg_class(vm, "Ljava/util/concurrent/Future;", obj);
-    add_method(future_cls, "get", "L", DX_ACC_PUBLIC, native_return_null, false);
-    add_method(future_cls, "get", "LJL", DX_ACC_PUBLIC, native_return_null, false); // get(long timeout, TimeUnit)
+    future_cls->instance_field_count = 1; // field[0] = stored result
+    add_method(future_cls, "get", "L", DX_ACC_PUBLIC, native_future_get, false);
+    add_method(future_cls, "get", "LJL", DX_ACC_PUBLIC, native_future_get, false); // get(long timeout, TimeUnit)
     add_method(future_cls, "isDone", "Z", DX_ACC_PUBLIC, native_return_true, false);
     add_method(future_cls, "isCancelled", "Z", DX_ACC_PUBLIC, native_return_false, false);
     add_method(future_cls, "cancel", "ZZ", DX_ACC_PUBLIC, native_return_false, false);
+
+    // java.util.concurrent.Callable
+    DxClass *callable_cls = reg_class(vm, "Ljava/util/concurrent/Callable;", obj);
+    add_method(callable_cls, "call", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    // java.util.concurrent.CompletableFuture
+    DxClass *cf_cls = reg_class(vm, "Ljava/util/concurrent/CompletableFuture;", future_cls);
+    cf_cls->instance_field_count = 1; // field[0] = stored value
+    add_method(cf_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(cf_cls, "completedFuture", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_cf_completed_future, true);
+    add_method(cf_cls, "get", "L", DX_ACC_PUBLIC, native_future_get, false);
+    add_method(cf_cls, "get", "LJL", DX_ACC_PUBLIC, native_future_get, false);
+    add_method(cf_cls, "join", "L", DX_ACC_PUBLIC, native_future_get, false);
+    add_method(cf_cls, "getNow", "LL", DX_ACC_PUBLIC, native_future_get, false);
+    add_method(cf_cls, "isDone", "Z", DX_ACC_PUBLIC, native_return_true, false);
+    add_method(cf_cls, "isCancelled", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(cf_cls, "isCompletedExceptionally", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(cf_cls, "complete", "ZL", DX_ACC_PUBLIC, native_cf_complete, false);
+    add_method(cf_cls, "thenApply", "LL", DX_ACC_PUBLIC, native_cf_then_apply, false);
+    add_method(cf_cls, "thenAccept", "LL", DX_ACC_PUBLIC, native_cf_then_accept, false);
+    add_method(cf_cls, "thenRun", "LL", DX_ACC_PUBLIC, native_cf_then_run, false);
+    add_method(cf_cls, "thenApplyAsync", "LL", DX_ACC_PUBLIC, native_cf_then_apply, false);
+    add_method(cf_cls, "thenAcceptAsync", "LL", DX_ACC_PUBLIC, native_cf_then_accept, false);
+    add_method(cf_cls, "thenRunAsync", "LL", DX_ACC_PUBLIC, native_cf_then_run, false);
+    add_method(cf_cls, "whenComplete", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(cf_cls, "exceptionally", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(cf_cls, "handle", "LL", DX_ACC_PUBLIC, native_return_self, false);
+
+    // java.util.concurrent.ThreadPoolExecutor (extends ExecutorService)
+    DxClass *tpe_cls = reg_class(vm, "Ljava/util/concurrent/ThreadPoolExecutor;", executor_svc_cls);
+    add_method(tpe_cls, "<init>", "VIIJLLL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(tpe_cls, "execute", "VL", DX_ACC_PUBLIC, native_handler_post, false);
+    add_method(tpe_cls, "submit", "LL", DX_ACC_PUBLIC, native_executor_submit, false);
+    add_method(tpe_cls, "shutdown", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(tpe_cls, "shutdownNow", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(tpe_cls, "isShutdown", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(tpe_cls, "isTerminated", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(tpe_cls, "getPoolSize", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
+    add_method(tpe_cls, "getActiveCount", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
+    add_method(tpe_cls, "setCorePoolSize", "VI", DX_ACC_PUBLIC, native_noop, false);
+    add_method(tpe_cls, "setMaximumPoolSize", "VI", DX_ACC_PUBLIC, native_noop, false);
+
+    // java.util.concurrent.ScheduledExecutorService
+    DxClass *sched_exec_cls = reg_class(vm, "Ljava/util/concurrent/ScheduledExecutorService;", executor_svc_cls);
+    add_method(sched_exec_cls, "schedule", "LLJL", DX_ACC_PUBLIC, native_executor_submit, false);
+    add_method(sched_exec_cls, "scheduleAtFixedRate", "LLLJL", DX_ACC_PUBLIC, native_executor_submit, false);
+    add_method(sched_exec_cls, "scheduleWithFixedDelay", "LLLJL", DX_ACC_PUBLIC, native_executor_submit, false);
+    add_method(sched_exec_cls, "execute", "VL", DX_ACC_PUBLIC, native_handler_post, false);
+    add_method(sched_exec_cls, "submit", "LL", DX_ACC_PUBLIC, native_executor_submit, false);
+    add_method(sched_exec_cls, "shutdown", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(sched_exec_cls, "shutdownNow", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    // java.util.concurrent.ScheduledThreadPoolExecutor
+    DxClass *stpe_cls = reg_class(vm, "Ljava/util/concurrent/ScheduledThreadPoolExecutor;", sched_exec_cls);
+    add_method(stpe_cls, "<init>", "VI", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(stpe_cls, "<init>", "VIL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(stpe_cls, "schedule", "LLJL", DX_ACC_PUBLIC, native_executor_submit, false);
+    add_method(stpe_cls, "execute", "VL", DX_ACC_PUBLIC, native_handler_post, false);
+    add_method(stpe_cls, "submit", "LL", DX_ACC_PUBLIC, native_executor_submit, false);
+    add_method(stpe_cls, "shutdown", "V", DX_ACC_PUBLIC, native_noop, false);
 
     DxClass *countdown_cls = reg_class(vm, "Ljava/util/concurrent/CountDownLatch;", obj);
     countdown_cls->instance_field_count = 1; // field[0] = count
@@ -11096,10 +12248,13 @@ DxResult dx_register_android_framework(DxVM *vm) {
 
     // --- java.lang.* (additional) ---
     DxClass *thread_cls = reg_class(vm, "Ljava/lang/Thread;", obj);
+    thread_cls->instance_field_count = 1; // field[0] = Runnable target
     add_method(thread_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
                native_noop, false);
     add_method(thread_cls, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
-               native_noop, false);
+               native_thread_init_runnable, false);
+    add_method(thread_cls, "<init>", "VLL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_thread_init_runnable, false); // Thread(Runnable, String)
     add_method(thread_cls, "start", "V", DX_ACC_PUBLIC,
                native_thread_start, false); // synchronous: run this.run()
     add_method(thread_cls, "run", "V", DX_ACC_PUBLIC, native_noop, false);
@@ -11323,10 +12478,60 @@ DxResult dx_register_android_framework(DxVM *vm) {
 
     // --- android.transition.* ---
     DxClass *transition_cls = reg_class(vm, "Landroid/transition/Transition;", obj);
+    add_method(transition_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
     add_method(transition_cls, "addListener", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(transition_cls, "removeListener", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(transition_cls, "setDuration", "LJ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(transition_cls, "setInterpolator", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(transition_cls, "setStartDelay", "LJ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(transition_cls, "addTarget", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(transition_cls, "addTarget", "LI", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(transition_cls, "excludeTarget", "LLZ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(transition_cls, "excludeTarget", "LIZ", DX_ACC_PUBLIC, native_return_self, false);
+
+    // android.transition.Fade (extends Transition)
+    DxClass *fade_cls = reg_class(vm, "Landroid/transition/Fade;", transition_cls);
+    add_method(fade_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(fade_cls, "<init>", "VI", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+
+    // android.transition.ChangeBounds (extends Transition)
+    DxClass *change_bounds_cls = reg_class(vm, "Landroid/transition/ChangeBounds;", transition_cls);
+    add_method(change_bounds_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(change_bounds_cls, "setResizeClip", "VZ", DX_ACC_PUBLIC, native_noop, false);
+
+    // android.transition.TransitionSet (extends Transition)
+    DxClass *transition_set_cls = reg_class(vm, "Landroid/transition/TransitionSet;", transition_cls);
+    add_method(transition_set_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(transition_set_cls, "addTransition", "LL", DX_ACC_PUBLIC,
+               native_return_self, false);
+    add_method(transition_set_cls, "setOrdering", "LI", DX_ACC_PUBLIC,
+               native_return_self, false);
+
+    // android.transition.AutoTransition (extends TransitionSet)
+    DxClass *auto_transition_cls = reg_class(vm, "Landroid/transition/AutoTransition;", transition_set_cls);
+    add_method(auto_transition_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+
+    // android.transition.Slide (extends Transition)
+    DxClass *slide_cls = reg_class(vm, "Landroid/transition/Slide;", transition_cls);
+    add_method(slide_cls, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
+    add_method(slide_cls, "<init>", "VI", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR,
+               native_noop, false);
 
     DxClass *transition_mgr_cls = reg_class(vm, "Landroid/transition/TransitionManager;", obj);
+    add_method(transition_mgr_cls, "beginDelayedTransition", "VL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_noop, true);
     add_method(transition_mgr_cls, "beginDelayedTransition", "VLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_noop, true);
+    add_method(transition_mgr_cls, "go", "VL", DX_ACC_PUBLIC | DX_ACC_STATIC,
+               native_noop, true);
+    add_method(transition_mgr_cls, "go", "VLL", DX_ACC_PUBLIC | DX_ACC_STATIC,
                native_noop, true);
 
     // ================================================================
@@ -12072,6 +13277,7 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(rx2_observable, "create", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
     add_method(rx2_observable, "map", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(rx2_observable, "flatMap", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx2_observable, "filter", "LL", DX_ACC_PUBLIC, native_return_self, false);
 
     DxClass *rx2_single = reg_class(vm, "Lio/reactivex/Single;", obj);
     add_method(rx2_single, "subscribe", "LL", DX_ACC_PUBLIC, native_return_null, false);
@@ -12079,12 +13285,14 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(rx2_single, "subscribeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(rx2_single, "just", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
     add_method(rx2_single, "map", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx2_single, "flatMap", "LL", DX_ACC_PUBLIC, native_return_self, false);
 
     DxClass *rx2_completable = reg_class(vm, "Lio/reactivex/Completable;", obj);
     add_method(rx2_completable, "subscribe", "L", DX_ACC_PUBLIC, native_return_null, false);
     add_method(rx2_completable, "subscribeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(rx2_completable, "observeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(rx2_completable, "complete", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx2_completable, "andThen", "LL", DX_ACC_PUBLIC, native_return_self, false);
 
     DxClass *rx2_schedulers = reg_class(vm, "Lio/reactivex/schedulers/Schedulers;", obj);
     add_method(rx2_schedulers, "io", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
@@ -12098,6 +13306,7 @@ DxResult dx_register_android_framework(DxVM *vm) {
                native_return_null, true);
 
     DxClass *rx2_disposable = reg_class(vm, "Lio/reactivex/disposables/Disposable;", obj);
+    rx2_disposable->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
     add_method(rx2_disposable, "dispose", "V", DX_ACC_PUBLIC, native_noop, false);
     add_method(rx2_disposable, "isDisposed", "Z", DX_ACC_PUBLIC, native_return_false, false);
 
@@ -12106,31 +13315,315 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(rx2_composite, "add", "ZL", DX_ACC_PUBLIC, native_return_true, false);
     add_method(rx2_composite, "dispose", "V", DX_ACC_PUBLIC, native_noop, false);
     add_method(rx2_composite, "clear", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(rx2_composite, "isDisposed", "Z", DX_ACC_PUBLIC, native_return_false, false);
 
-    // OkHttp stubs (very common networking lib)
+    // RxJava3 (io.reactivex.rxjava3) - most common in modern apps
+    DxClass *rx3_observable = reg_class(vm, "Lio/reactivex/rxjava3/core/Observable;", obj);
+    add_method(rx3_observable, "subscribe", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(rx3_observable, "subscribe", "LLLL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(rx3_observable, "map", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "flatMap", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "filter", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "observeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "subscribeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "just", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_observable, "fromIterable", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_observable, "create", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_observable, "empty", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_observable, "defer", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_observable, "doOnNext", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "doOnError", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "doOnComplete", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "toList", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(rx3_observable, "distinctUntilChanged", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "take", "LJ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "skip", "LJ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "debounce", "LJL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "switchMap", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_observable, "concatMap", "LL", DX_ACC_PUBLIC, native_return_self, false);
+
+    DxClass *rx3_single = reg_class(vm, "Lio/reactivex/rxjava3/core/Single;", obj);
+    add_method(rx3_single, "subscribe", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(rx3_single, "observeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_single, "subscribeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_single, "just", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_single, "create", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_single, "map", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_single, "flatMap", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_single, "doOnSuccess", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_single, "doOnError", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_single, "toObservable", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *rx3_completable = reg_class(vm, "Lio/reactivex/rxjava3/core/Completable;", obj);
+    add_method(rx3_completable, "subscribe", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(rx3_completable, "subscribeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_completable, "observeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_completable, "complete", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_completable, "andThen", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_completable, "doOnComplete", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_completable, "doOnError", "LL", DX_ACC_PUBLIC, native_return_self, false);
+
+    DxClass *rx3_maybe = reg_class(vm, "Lio/reactivex/rxjava3/core/Maybe;", obj);
+    add_method(rx3_maybe, "subscribe", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(rx3_maybe, "map", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_maybe, "flatMap", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_maybe, "observeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_maybe, "subscribeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_maybe, "just", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_maybe, "empty", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_maybe, "doOnSuccess", "LL", DX_ACC_PUBLIC, native_return_self, false);
+
+    DxClass *rx3_flowable = reg_class(vm, "Lio/reactivex/rxjava3/core/Flowable;", obj);
+    add_method(rx3_flowable, "subscribe", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(rx3_flowable, "map", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_flowable, "flatMap", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_flowable, "filter", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_flowable, "observeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_flowable, "subscribeOn", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(rx3_flowable, "just", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_flowable, "fromIterable", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_flowable, "create", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_flowable, "toObservable", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *rx3_disposable = reg_class(vm, "Lio/reactivex/rxjava3/disposables/Disposable;", obj);
+    rx3_disposable->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    add_method(rx3_disposable, "dispose", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(rx3_disposable, "isDisposed", "Z", DX_ACC_PUBLIC, native_return_false, false);
+
+    DxClass *rx3_composite = reg_class(vm, "Lio/reactivex/rxjava3/disposables/CompositeDisposable;", obj);
+    add_method(rx3_composite, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(rx3_composite, "add", "ZL", DX_ACC_PUBLIC, native_return_true, false);
+    add_method(rx3_composite, "dispose", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(rx3_composite, "clear", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(rx3_composite, "isDisposed", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(rx3_composite, "size", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
+    add_method(rx3_composite, "delete", "ZL", DX_ACC_PUBLIC, native_return_true, false);
+
+    DxClass *rx3_schedulers = reg_class(vm, "Lio/reactivex/rxjava3/schedulers/Schedulers;", obj);
+    add_method(rx3_schedulers, "io", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_schedulers, "computation", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_schedulers, "newThread", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_schedulers, "single", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_schedulers, "trampoline", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_schedulers, "shutdown", "V", DX_ACC_PUBLIC | DX_ACC_STATIC, native_noop, true);
+
+    DxClass *rx3_android_schedulers = reg_class(vm, "Lio/reactivex/rxjava3/android/schedulers/AndroidSchedulers;", obj);
+    add_method(rx3_android_schedulers, "mainThread", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    DxClass *rx3_scheduler = reg_class(vm, "Lio/reactivex/rxjava3/core/Scheduler;", obj);
+    add_method(rx3_scheduler, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(rx3_scheduler, "createWorker", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(rx3_scheduler, "scheduleDirect", "LLL", DX_ACC_PUBLIC, native_return_null, false);
+
+    // --- OkHttp3 stubs (com.squareup.okhttp3) ---
     DxClass *okhttp_client = reg_class(vm, "Lokhttp3/OkHttpClient;", obj);
     add_method(okhttp_client, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
     add_method(okhttp_client, "newCall", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_client, "dispatcher", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_client, "connectionPool", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_client, "interceptors", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_client, "networkInterceptors", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_client, "cache", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_client, "newBuilder", "L", DX_ACC_PUBLIC, native_return_null, false);
 
     DxClass *okhttp_builder = reg_class(vm, "Lokhttp3/OkHttpClient$Builder;", obj);
     add_method(okhttp_builder, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
     add_method(okhttp_builder, "build", "L", DX_ACC_PUBLIC, native_return_null, false);
     add_method(okhttp_builder, "connectTimeout", "LJL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(okhttp_builder, "readTimeout", "LJL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "writeTimeout", "LJL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "callTimeout", "LJL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(okhttp_builder, "addInterceptor", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "addNetworkInterceptor", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "cache", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "cookieJar", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "dns", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "followRedirects", "LZ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "followSslRedirects", "LZ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "hostnameVerifier", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "sslSocketFactory", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "retryOnConnectionFailure", "LZ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "proxy", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "certificatePinner", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "authenticator", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "dispatcher", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "connectionPool", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "protocols", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "connectionSpecs", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "eventListenerFactory", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_builder, "pingInterval", "LJL", DX_ACC_PUBLIC, native_return_self, false);
 
     DxClass *okhttp_request = reg_class(vm, "Lokhttp3/Request;", obj);
+    add_method(okhttp_request, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
     add_method(okhttp_request, "url", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_request, "method", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_request, "headers", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_request, "body", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_request, "header", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_request, "newBuilder", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_request, "tag", "L", DX_ACC_PUBLIC, native_return_null, false);
 
     DxClass *okhttp_req_builder = reg_class(vm, "Lokhttp3/Request$Builder;", obj);
     add_method(okhttp_req_builder, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
     add_method(okhttp_req_builder, "url", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(okhttp_req_builder, "build", "L", DX_ACC_PUBLIC, native_return_null, false);
     add_method(okhttp_req_builder, "addHeader", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "header", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "removeHeader", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "get", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "post", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "put", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "delete", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "delete", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "patch", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "method", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "tag", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "cacheControl", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_req_builder, "headers", "LL", DX_ACC_PUBLIC, native_return_self, false);
 
-    // Retrofit stubs
+    DxClass *okhttp_response = reg_class(vm, "Lokhttp3/Response;", obj);
+    add_method(okhttp_response, "code", "I", DX_ACC_PUBLIC, native_return_int_200, false);
+    add_method(okhttp_response, "body", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_response, "isSuccessful", "Z", DX_ACC_PUBLIC, native_return_true, false);
+    add_method(okhttp_response, "message", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_response, "headers", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_response, "header", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_response, "request", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_response, "protocol", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_response, "close", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(okhttp_response, "newBuilder", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_response, "cacheResponse", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_response, "networkResponse", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_resp_builder = reg_class(vm, "Lokhttp3/Response$Builder;", obj);
+    add_method(okhttp_resp_builder, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(okhttp_resp_builder, "code", "LI", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_resp_builder, "message", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_resp_builder, "body", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_resp_builder, "request", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_resp_builder, "protocol", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_resp_builder, "header", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_resp_builder, "addHeader", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_resp_builder, "build", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_resp_body = reg_class(vm, "Lokhttp3/ResponseBody;", obj);
+    add_method(okhttp_resp_body, "string", "L", DX_ACC_PUBLIC, native_return_empty_json_string, false);
+    add_method(okhttp_resp_body, "bytes", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_resp_body, "byteStream", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_resp_body, "charStream", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_resp_body, "source", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_resp_body, "contentType", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_resp_body, "contentLength", "J", DX_ACC_PUBLIC, native_return_long_zero, false);
+    add_method(okhttp_resp_body, "close", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(okhttp_resp_body, "create", "LLL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    DxClass *okhttp_req_body = reg_class(vm, "Lokhttp3/RequestBody;", obj);
+    add_method(okhttp_req_body, "create", "LLL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(okhttp_req_body, "create", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(okhttp_req_body, "contentType", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_req_body, "contentLength", "J", DX_ACC_PUBLIC, native_return_long_zero, false);
+    add_method(okhttp_req_body, "writeTo", "VL", DX_ACC_PUBLIC, native_noop, false);
+
+    DxClass *okhttp_media_type = reg_class(vm, "Lokhttp3/MediaType;", obj);
+    add_method(okhttp_media_type, "parse", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(okhttp_media_type, "get", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(okhttp_media_type, "type", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_media_type, "subtype", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_media_type, "charset", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_call = reg_class(vm, "Lokhttp3/Call;", obj);
+    okhttp_call->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    add_method(okhttp_call, "execute", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_call, "enqueue", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(okhttp_call, "cancel", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(okhttp_call, "isExecuted", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(okhttp_call, "isCanceled", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(okhttp_call, "clone", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_call, "request", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_callback = reg_class(vm, "Lokhttp3/Callback;", obj);
+    okhttp_callback->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    add_method(okhttp_callback, "onResponse", "VLL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(okhttp_callback, "onFailure", "VLL", DX_ACC_PUBLIC, native_noop, false);
+
+    DxClass *okhttp_interceptor = reg_class(vm, "Lokhttp3/Interceptor;", obj);
+    okhttp_interceptor->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    add_method(okhttp_interceptor, "intercept", "LL", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_interceptor_chain = reg_class(vm, "Lokhttp3/Interceptor$Chain;", obj);
+    okhttp_interceptor_chain->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    add_method(okhttp_interceptor_chain, "request", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_interceptor_chain, "proceed", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_interceptor_chain, "connection", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_headers = reg_class(vm, "Lokhttp3/Headers;", obj);
+    add_method(okhttp_headers, "get", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_headers, "size", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
+    add_method(okhttp_headers, "name", "LI", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_headers, "value", "LI", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_headers, "names", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_headers, "values", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_headers, "newBuilder", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_headers, "of", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    DxClass *okhttp_headers_builder = reg_class(vm, "Lokhttp3/Headers$Builder;", obj);
+    add_method(okhttp_headers_builder, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(okhttp_headers_builder, "add", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_headers_builder, "set", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_headers_builder, "removeAll", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_headers_builder, "build", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_http_url = reg_class(vm, "Lokhttp3/HttpUrl;", obj);
+    add_method(okhttp_http_url, "parse", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(okhttp_http_url, "newBuilder", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_http_url, "toString", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_cache_control = reg_class(vm, "Lokhttp3/CacheControl;", obj);
+    add_method(okhttp_cache_control, "parse", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(okhttp_cache_control, "noCache", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(okhttp_cache_control, "noStore", "Z", DX_ACC_PUBLIC, native_return_false, false);
+
+    DxClass *okhttp_form_body = reg_class(vm, "Lokhttp3/FormBody;", okhttp_req_body);
+    add_method(okhttp_form_body, "size", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
+    add_method(okhttp_form_body, "name", "LI", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_form_body, "value", "LI", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_form_body_builder = reg_class(vm, "Lokhttp3/FormBody$Builder;", obj);
+    add_method(okhttp_form_body_builder, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(okhttp_form_body_builder, "add", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_form_body_builder, "addEncoded", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_form_body_builder, "build", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_multipart_body = reg_class(vm, "Lokhttp3/MultipartBody;", okhttp_req_body);
+    add_method(okhttp_multipart_body, "parts", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(okhttp_multipart_body, "size", "I", DX_ACC_PUBLIC, native_return_int_zero, false);
+    add_method(okhttp_multipart_body, "type", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_multipart_builder = reg_class(vm, "Lokhttp3/MultipartBody$Builder;", obj);
+    add_method(okhttp_multipart_builder, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(okhttp_multipart_builder, "setType", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_multipart_builder, "addFormDataPart", "LLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_multipart_builder, "addFormDataPart", "LLLL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_multipart_builder, "addPart", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_multipart_builder, "build", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_logging = reg_class(vm, "Lokhttp3/logging/HttpLoggingInterceptor;", obj);
+    add_method(okhttp_logging, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(okhttp_logging, "<init>", "VL", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(okhttp_logging, "setLevel", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(okhttp_logging, "getLevel", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *okhttp_logging_level = reg_class(vm, "Lokhttp3/logging/HttpLoggingInterceptor$Level;", obj);
+    add_method(okhttp_logging_level, "values", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    // --- Retrofit2 stubs (com.squareup.retrofit2) ---
     DxClass *retrofit_cls = reg_class(vm, "Lretrofit2/Retrofit;", obj);
     add_method(retrofit_cls, "create", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_cls, "baseUrl", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_cls, "callFactory", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_cls, "converterFactories", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_cls, "callAdapterFactories", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_cls, "newBuilder", "L", DX_ACC_PUBLIC, native_return_null, false);
 
     DxClass *retrofit_builder = reg_class(vm, "Lretrofit2/Retrofit$Builder;", obj);
     add_method(retrofit_builder, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
@@ -12139,11 +13632,130 @@ DxResult dx_register_android_framework(DxVM *vm) {
     add_method(retrofit_builder, "addConverterFactory", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(retrofit_builder, "addCallAdapterFactory", "LL", DX_ACC_PUBLIC, native_return_self, false);
     add_method(retrofit_builder, "build", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_builder, "callFactory", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(retrofit_builder, "callbackExecutor", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(retrofit_builder, "validateEagerly", "LZ", DX_ACC_PUBLIC, native_return_self, false);
 
-    // Glide / Picasso (image loading)
+    DxClass *retrofit_converter_factory = reg_class(vm, "Lretrofit2/Converter$Factory;", obj);
+    retrofit_converter_factory->access_flags = DX_ACC_ABSTRACT;
+    add_method(retrofit_converter_factory, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(retrofit_converter_factory, "responseBodyConverter", "LLLL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_converter_factory, "requestBodyConverter", "LLLLL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_converter_factory, "stringConverter", "LLLL", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_calladapter_factory = reg_class(vm, "Lretrofit2/CallAdapter$Factory;", obj);
+    retrofit_calladapter_factory->access_flags = DX_ACC_ABSTRACT;
+    add_method(retrofit_calladapter_factory, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(retrofit_calladapter_factory, "get", "LLLL", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_call = reg_class(vm, "Lretrofit2/Call;", obj);
+    retrofit_call->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    add_method(retrofit_call, "execute", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_call, "enqueue", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(retrofit_call, "cancel", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(retrofit_call, "clone", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_call, "isExecuted", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(retrofit_call, "isCanceled", "Z", DX_ACC_PUBLIC, native_return_false, false);
+    add_method(retrofit_call, "request", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *retrofit_callback = reg_class(vm, "Lretrofit2/Callback;", obj);
+    retrofit_callback->access_flags = DX_ACC_INTERFACE | DX_ACC_ABSTRACT;
+    add_method(retrofit_callback, "onResponse", "VLL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(retrofit_callback, "onFailure", "VLL", DX_ACC_PUBLIC, native_noop, false);
+
+    DxClass *retrofit_response = reg_class(vm, "Lretrofit2/Response;", obj);
+    add_method(retrofit_response, "body", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_response, "code", "I", DX_ACC_PUBLIC, native_return_int_200, false);
+    add_method(retrofit_response, "isSuccessful", "Z", DX_ACC_PUBLIC, native_return_true, false);
+    add_method(retrofit_response, "errorBody", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_response, "message", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_response, "headers", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_response, "raw", "L", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(retrofit_response, "success", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(retrofit_response, "error", "LIL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    // Gson converter (most common Retrofit converter)
+    DxClass *gson_converter = reg_class(vm, "Lretrofit2/converter/gson/GsonConverterFactory;", retrofit_converter_factory);
+    add_method(gson_converter, "create", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(gson_converter, "create", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    // Moshi converter (another common Retrofit converter)
+    DxClass *moshi_converter = reg_class(vm, "Lretrofit2/converter/moshi/MoshiConverterFactory;", retrofit_converter_factory);
+    add_method(moshi_converter, "create", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(moshi_converter, "create", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    // Scalars converter
+    DxClass *scalars_converter = reg_class(vm, "Lretrofit2/converter/scalars/ScalarsConverterFactory;", retrofit_converter_factory);
+    add_method(scalars_converter, "create", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    // RxJava3 call adapter
+    DxClass *rx3_calladapter = reg_class(vm, "Lretrofit2/adapter/rxjava3/RxJava3CallAdapterFactory;", retrofit_calladapter_factory);
+    add_method(rx3_calladapter, "create", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx3_calladapter, "createSynchronous", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    // RxJava2 call adapter
+    DxClass *rx2_calladapter = reg_class(vm, "Lretrofit2/adapter/rxjava2/RxJava2CallAdapterFactory;", retrofit_calladapter_factory);
+    add_method(rx2_calladapter, "create", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(rx2_calladapter, "createAsync", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    // --- Glide stubs (com.bumptech.glide) ---
     DxClass *glide_cls = reg_class(vm, "Lcom/bumptech/glide/Glide;", obj);
     add_method(glide_cls, "with", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
     add_method(glide_cls, "get", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(glide_cls, "init", "VLL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_noop, true);
+
+    DxClass *glide_req_manager = reg_class(vm, "Lcom/bumptech/glide/RequestManager;", obj);
+    add_method(glide_req_manager, "load", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(glide_req_manager, "load", "LI", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(glide_req_manager, "asBitmap", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_manager, "asDrawable", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_manager, "asGif", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_manager, "clear", "VL", DX_ACC_PUBLIC, native_noop, false);
+    add_method(glide_req_manager, "pauseRequests", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(glide_req_manager, "resumeRequests", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(glide_req_manager, "isPaused", "Z", DX_ACC_PUBLIC, native_return_false, false);
+
+    DxClass *glide_req_builder = reg_class(vm, "Lcom/bumptech/glide/RequestBuilder;", obj);
+    add_method(glide_req_builder, "into", "LL", DX_ACC_PUBLIC, native_return_null, false);
+    add_method(glide_req_builder, "placeholder", "LI", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "placeholder", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "error", "LI", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "error", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "override", "LII", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "override", "LI", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "centerCrop", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "centerInside", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "fitCenter", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "circleCrop", "L", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "transform", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "diskCacheStrategy", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "skipMemoryCache", "LZ", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "transition", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "thumbnail", "LF", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "listener", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "apply", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "load", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_req_builder, "preload", "V", DX_ACC_PUBLIC, native_noop, false);
+    add_method(glide_req_builder, "submit", "L", DX_ACC_PUBLIC, native_return_null, false);
+
+    DxClass *glide_req_options = reg_class(vm, "Lcom/bumptech/glide/request/RequestOptions;", obj);
+    add_method(glide_req_options, "<init>", "V", DX_ACC_PUBLIC | DX_ACC_CONSTRUCTOR, native_noop, false);
+    add_method(glide_req_options, "centerCropTransform", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(glide_req_options, "circleCropTransform", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(glide_req_options, "fitCenterTransform", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(glide_req_options, "overrideOf", "LII", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(glide_req_options, "placeholderOf", "LI", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(glide_req_options, "errorOf", "LI", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(glide_req_options, "diskCacheStrategyOf", "LL", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+    add_method(glide_req_options, "skipMemoryCacheOf", "LZ", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
+
+    DxClass *glide_disk_cache = reg_class(vm, "Lcom/bumptech/glide/load/engine/DiskCacheStrategy;", obj);
+    (void)glide_disk_cache; // NONE, DATA, RESOURCE, ALL, AUTOMATIC are static fields; class presence suffices
+
+    DxClass *glide_builder = reg_class(vm, "Lcom/bumptech/glide/GlideBuilder;", obj);
+    add_method(glide_builder, "setMemoryCache", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_builder, "setDiskCache", "LL", DX_ACC_PUBLIC, native_return_self, false);
+    add_method(glide_builder, "setDefaultRequestOptions", "LL", DX_ACC_PUBLIC, native_return_self, false);
 
     DxClass *picasso_cls = reg_class(vm, "Lcom/squareup/picasso/Picasso;", obj);
     add_method(picasso_cls, "get", "L", DX_ACC_PUBLIC | DX_ACC_STATIC, native_return_null, true);
