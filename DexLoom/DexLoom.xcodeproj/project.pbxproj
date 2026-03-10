@@ -37,7 +37,6 @@
 		DDC8D7D8EF93DC24F9C5EAA5 /* dx_log.c in Sources */ = {isa = PBXBuildFile; fileRef = 63CFFFE67B3A16E61DD61B47 /* dx_log.c */; };
 		E20AE5118921E5382486C537 /* dx_dex.c in Sources */ = {isa = PBXBuildFile; fileRef = 71153360B48DCC55BCB03882 /* dx_dex.c */; };
 		E43F03FB454586AFC8F06A2B /* DexLoomApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24E4C4A36BB89145F1E71EA0 /* DexLoomApp.swift */; };
-		ED8BAC042B63F5924E719439 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73800F3D24FD349F96B83DE9 /* ContentView.swift */; };
 		F66A927529D3FA454DE975A0 /* Colors.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA9B039BC46B7185B67D245F /* Colors.swift */; };
 		F99324507751E0A9AB7450FC /* AppRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F19FD758AC0817D46E2E099 /* AppRouter.swift */; };
 /* End PBXBuildFile section */
@@ -86,7 +85,6 @@
 		7211091B2D266EFA4B6624DC /* dx_verifier.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = dx_verifier.c; sourceTree = "<group>"; };
 		724D1901000D6D07D543B881 /* DexLoomUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DexLoomUITests.swift; sourceTree = "<group>"; };
 		72F2920CA461D6CBF1857FEE /* dx_context.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = dx_context.c; sourceTree = "<group>"; };
-		73800F3D24FD349F96B83DE9 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		79911768C0439A642E45E227 /* DexLoomUITestsLaunchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DexLoomUITestsLaunchTests.swift; sourceTree = "<group>"; };
 		84488DACFF9AD2B7F0B220FA /* dx_apk.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = dx_apk.h; sourceTree = "<group>"; };
 		8655819300273639D6C30950 /* dx_crash.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = dx_crash.c; sourceTree = "<group>"; };
@@ -132,7 +130,6 @@
 				0D171828D211F6E502DF71BC /* Test_APK */,
 				C9B57768477DBB2ACFC7A16D /* UI */,
 				F396148EB8219465B2D80DA8 /* Assets.xcassets */,
-				73800F3D24FD349F96B83DE9 /* ContentView.swift */,
 				24E4C4A36BB89145F1E71EA0 /* DexLoomApp.swift */,
 			);
 			path = DexLoom;
@@ -501,7 +498,6 @@
 				F99324507751E0A9AB7450FC /* AppRouter.swift in Sources */,
 				9F6FE735E7544DCFBA030C58 /* AppState.swift in Sources */,
 				F66A927529D3FA454DE975A0 /* Colors.swift in Sources */,
-				ED8BAC042B63F5924E719439 /* ContentView.swift in Sources */,
 				E43F03FB454586AFC8F06A2B /* DexLoomApp.swift in Sources */,
 				67332C4D07AAC8DAC26865C7 /* HomeView.swift in Sources */,
 				7B92E5CB2D5F23697F79894D /* LogsView.swift in Sources */,
